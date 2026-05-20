@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SBI
 // @namespace    https://worker.mturk.com/
-// @version      1.01
+// @version      1.02
 // @description  Super Fast Password-Protected Loader (HIT Catcher Optimized)
 // @match        https://worker.mturk.com/*
 // @match        https://*.mturk.com/*
@@ -59,7 +59,20 @@
     const iv   = b64ToBytes(payload.iv);
     const data = b64ToBytes(payload.data);
     const key  = await deriveKey(password, salt, iter);
-    const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, data);
+
+    // Web Crypto AES-GCM wants the auth tag concatenated to the ciphertext.
+    // The locker tool stores `tag` as a separate base64 field, so join them.
+    let ct;
+    if (payload.tag) {
+      const tag = b64ToBytes(payload.tag);
+      ct = new Uint8Array(data.length + tag.length);
+      ct.set(data, 0);
+      ct.set(tag, data.length);
+    } else {
+      ct = data;
+    }
+
+    const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ct);
     return new TextDecoder().decode(plain);
   }
 
