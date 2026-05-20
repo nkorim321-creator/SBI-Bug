@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         HasanBhaierSalamNin36.0
 // @namespace    https://worker.mturk.com/
-// @version      33.7
-// @description  Queue processor. Strict 1-Tab Queue enforcement. No auto-reload. 26 strict return phrases. Processing lag fixed. Single task-tab enforced via heartbeat.
+// @version      33.8
+// @description  Queue processor. Strict 1-Tab Queue enforcement. No auto-reload. 26 strict return phrases. Processing lag fixed. Single task-tab enforced via heartbeat. Auto-captcha detect+alert+resume. 20s task-tab auto-close safety net.
 // @author       Custom Script
 // @match        https://worker.mturk.com/*
 // @match        https://*.mturk.com/*
@@ -145,6 +145,99 @@
     const p=isPaused(); btn.textContent=p?'▶️ Resume':'⏸️ Pause';
     btn.style.background=p?'#22c55e':'#f59e0b'; btn.style.color=p?'#fff':'#0f172a';
   }
+
+  /* ═══════════════════════════════════════
+     CAPTCHA SYSTEM (auto-detect / alert / resume)
+     Adapted from NMSH_VACUUM v19
+  ═══════════════════════════════════════ */
+  const CAPTCHA_SYSTEM = {
+    active: false,
+    alertTimer: null,
+    solveTimer: null,
+    scanTimer: null,
+    wasPausedByCaptcha: false,
+
+    hasCaptchaInText(h){
+      return h ? /captchacharacters|validatecaptcha|\/captcha\/|g-recaptcha|recaptcha-checkbox|captchainput|opfcaptcha/i.test(h) : false;
+    },
+    hasCaptchaOnPage(){
+      if(!document.body) return false;
+      if(document.querySelector('img[src*="captcha" i],iframe[src*="recaptcha"],.g-recaptcha,.recaptcha-checkbox-border,input[name="captchacharacters"],form[action*="captcha" i]')) return true;
+      return /captchacharacters|CaptchaInput|validateCaptcha|opfcaptcha/i.test(document.body.innerHTML||'');
+    },
+    playAlert(){
+      try{
+        const ctx=new (window.AudioContext||window.webkitAudioContext)();
+        const comp=ctx.createDynamicsCompressor();
+        comp.threshold.value=-3; comp.ratio.value=15; comp.connect(ctx.destination);
+        [800,1200,800,1200,600,1000,600,1400].forEach((f,i)=>{
+          ['square','sawtooth'].forEach(type=>{
+            const o=ctx.createOscillator(),g=ctx.createGain();
+            o.type=type; o.frequency.value=f; o.connect(g); g.connect(comp);
+            const t=ctx.currentTime+i*.1;
+            g.gain.setValueAtTime(type==='square'?.9:.5,t);
+            g.gain.exponentialRampToValueAtTime(.01,t+.09);
+            o.start(t); o.stop(t+.09);
+          });
+        });
+        setTimeout(()=>{try{ctx.close();}catch(e){}},2000);
+      }catch(e){}
+    },
+    startRepeating(){
+      this.stopRepeating();
+      this.playAlert();
+      this.alertTimer=setInterval(()=>{
+        if(!this.active){this.stopRepeating();return;}
+        this.playAlert();
+      },20000);
+    },
+    stopRepeating(){if(this.alertTimer){clearInterval(this.alertTimer);this.alertTimer=null;}},
+    showOverlay(){
+      const ex=document.getElementById('hbsn-cap-ov'); if(ex) ex.remove();
+      const ov=document.createElement('div'); ov.id='hbsn-cap-ov';
+      ov.style.cssText='position:fixed;top:0;left:0;right:0;z-index:2147483647';
+      ov.innerHTML='<div style="background:#c0392b;color:#fff;padding:10px;text-align:center;font:bold 16px system-ui;box-shadow:0 3px 15px rgba(0,0,0,.4)">⚠️ CAPTCHA — SOLVE NOW<span style="display:block;font-size:11px;opacity:.8;margin-top:3px">Script auto-resumes after solve</span><button id="hbsn-cap-dismiss" style="margin-left:12px;padding:3px 10px;background:#fff;color:#c0392b;border:none;border-radius:3px;font-weight:bold;cursor:pointer">OK</button></div>';
+      if(document.body) document.body.appendChild(ov);
+      const btn=document.getElementById('hbsn-cap-dismiss');
+      if(btn) btn.addEventListener('click',()=>ov.remove());
+    },
+    removeOverlay(){const el=document.getElementById('hbsn-cap-ov'); if(el) el.remove();},
+    startSolveMonitor(){
+      if(this.solveTimer) clearInterval(this.solveTimer);
+      this.solveTimer=setInterval(()=>{
+        if(!this.hasCaptchaOnPage()) this.onSolved();
+      },500);
+    },
+    stopSolveMonitor(){if(this.solveTimer){clearInterval(this.solveTimer);this.solveTimer=null;}},
+    onSolved(){
+      this.active=false;
+      this.stopRepeating(); this.stopSolveMonitor(); this.removeOverlay();
+      GM_setValue('hbsn_cap_active',0);
+      console.log('[HBSN] ✓ CAPTCHA solved — auto-resuming');
+      if(this.wasPausedByCaptcha){
+        this.wasPausedByCaptcha=false;
+        if(isPaused()) setPaused(false);
+      }
+    },
+    activate(){
+      if(this.active) return;
+      this.active=true;
+      GM_setValue('hbsn_cap_active',1);
+      console.warn('[HBSN] ⚠ CAPTCHA detected on page!');
+      if(!isPaused()){
+        this.wasPausedByCaptcha=true;
+        setPaused(true);
+      }
+      this.showOverlay(); this.startRepeating(); this.startSolveMonitor();
+    },
+    init(){
+      if(this.scanTimer) return;
+      const tryActivate=()=>{ if(this.hasCaptchaOnPage() && !this.active) this.activate(); };
+      if(document.body) tryActivate();
+      else document.addEventListener('DOMContentLoaded',tryActivate);
+      this.scanTimer=setInterval(tryActivate,2000);
+    }
+  };
 
   function getDB()    { try{return JSON.parse(GM_getValue('hbsn_word_db','{}'));}catch(e){return{};} }
   function saveDB(db) { GM_setValue('hbsn_word_db',JSON.stringify(db)); }
@@ -455,6 +548,7 @@
     }
 
     addQueueUI(); addDBManagerUI();
+    CAPTCHA_SYSTEM.init();
     checkStaleLock();
 
     if(isPaused()){
@@ -795,6 +889,22 @@
     addTaskUI('…','🔍 Scanning…');
     taskStatus('⏳ Waiting for page to load…');
     GM_setValue('hbsn_time',Date.now());
+
+    CAPTCHA_SYSTEM.init();
+
+    /* ★ 20-SECOND HARD AUTO-CLOSE (safety net for stuck task tabs) */
+    setTimeout(()=>{
+      if(CAPTCHA_SYSTEM.active){
+        console.log('[HBSN] 20s timer fired but CAPTCHA active — skipping close');
+        return;
+      }
+      console.warn('[HBSN] ⏰ 20s auto-close — force closing task tab');
+      taskStatus('⏰ 20s timer — force closing…');
+      markSubmitted();
+      clearTaskHeartbeat();
+      releaseLock();
+      forceCloseTab();
+    },20000);
 
     window.addEventListener('beforeunload',()=>{ if(!done){ clearTaskHeartbeat(); releaseLock(); } });
 
