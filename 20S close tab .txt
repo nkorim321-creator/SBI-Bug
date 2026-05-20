@@ -1,0 +1,46 @@
+// ==UserScript==
+// @name         MTurk Single Project Tab & Auto Close (20s)
+// @namespace    http://tampermonkey.net/
+// @version      1.4
+// @description  Prevents duplicate tabs and completely closes the main tab after 20 seconds
+// @author       You
+// @match        https://worker.mturk.com/projects/*
+// @grant        window.close
+// ==/UserScript==
+
+(function() {
+    'use strict';
+
+    // Create a communication channel between tabs
+    const channel = new BroadcastChannel('mturk_duplicate_preventer');
+    const myId = Date.now().toString();
+    let amIFirst = false;
+
+    // Listen for messages from other tabs
+    channel.onmessage = function(event) {
+        // If a new tab asks "who is here", and I am the first/main tab, tell it to close
+        if (event.data.action === 'WHO_IS_HERE' && amIFirst) {
+            channel.postMessage({ action: 'CLOSE_TAB', targetId: event.data.id });
+        }
+        // If the main tab tells me to close, I will close myself
+        if (event.data.action === 'CLOSE_TAB' && event.data.targetId === myId) {
+            window.close();
+        }
+    };
+
+    // As soon as this tab opens, ask if any older tab is already open
+    channel.postMessage({ action: 'WHO_IS_HERE', id: myId });
+
+    // If no one answers within 300ms, assume this is the first/main tab
+    setTimeout(() => {
+        amIFirst = true;
+
+        // 20-second timer (20,000 milliseconds)
+        // After 20 seconds, close this main tab completely
+        setTimeout(() => {
+            window.close();
+        }, 20000);
+
+    }, 300);
+
+})();
