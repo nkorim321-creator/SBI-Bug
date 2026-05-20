@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         HasanBhaierSalamNin36.0
 // @namespace    https://worker.mturk.com/
-// @version      33.9
-// @description  Queue processor. Strict 1-Tab Queue enforcement. No auto-reload. 26 strict return phrases. Processing lag fixed. Single task-tab enforced via heartbeat. Auto-captcha detect+alert+resume. Amazon "Server Busy" auto-dismiss. 20s task-tab auto-close safety net.
+// @version      33.10
+// @description  Queue processor. Strict 1-Tab Queue enforcement. No auto-reload. 26 strict return phrases. Processing lag fixed. Single task-tab enforced via heartbeat. Auto-captcha detect+alert+resume. Amazon "Server Busy" auto-dismiss. 20s auto-close for any MTurk tab except /tasks queue.
 // @author       Custom Script
 // @match        https://worker.mturk.com/*
 // @match        https://*.mturk.com/*
@@ -182,6 +182,42 @@
       setTimeout(()=>{try{location.href='https://worker.mturk.com/dashboard';}catch(e){}},500);
     },1000);
     return true;
+  }
+
+  /* ═══════════════════════════════════════
+     GENERAL MTURK TAB AUTO-CLOSE (20s)
+     Closes ANY MTurk tab that isn't the /tasks queue page after
+     20 seconds. Skips iframes and pauses if a CAPTCHA is active.
+  ═══════════════════════════════════════ */
+  function isMTurkQueueTab(){
+    const u=location.href;
+    if(u.includes('/projects/')||u.includes('/assignments/')) return false;
+    return u.includes('worker.mturk.com/queue') || u.includes('worker.mturk.com/tasks')
+        || u==='https://worker.mturk.com/' || u==='https://worker.mturk.com';
+  }
+  function isMTurkDomain(){
+    return /(^|\.)mturk\.com$/i.test(location.hostname);
+  }
+  let _autoCloseArmed=false;
+  function setupGeneralAutoClose(){
+    if(_autoCloseArmed) return;
+    if(!isMTurkDomain()) return;
+    if(window.self!==window.top) return;
+    if(isMTurkQueueTab()) return;
+    _autoCloseArmed=true;
+    console.log('[HBSN] 20s general auto-close armed for',location.href);
+    setTimeout(()=>{
+      if(CAPTCHA_SYSTEM.active){
+        console.log('[HBSN] 20s auto-close: CAPTCHA active — skipping');
+        return;
+      }
+      console.warn('[HBSN] ⏰ 20s auto-close — closing non-/tasks MTurk tab');
+      try{markSubmitted();}catch(e){}
+      try{clearTaskHeartbeat();}catch(e){}
+      try{releaseLock();}catch(e){}
+      try{window.close();}catch(e){}
+      setTimeout(()=>{try{window.open('','_self');window.close();}catch(e){}},150);
+    },20000);
   }
 
   /* ═══════════════════════════════════════
@@ -482,6 +518,9 @@
       if(handleServerBusy() || ++polls>20) clearInterval(t);
     },300);
   })();
+
+  /* ★ Arm the 20s general MTurk auto-close on every non-/tasks tab. */
+  setupGeneralAutoClose();
 
   const url     = location.href;
   const inFrame = window.self !== window.top;
@@ -941,20 +980,6 @@
     GM_setValue('hbsn_time',Date.now());
 
     CAPTCHA_SYSTEM.init();
-
-    /* ★ 20-SECOND HARD AUTO-CLOSE (safety net for stuck task tabs) */
-    setTimeout(()=>{
-      if(CAPTCHA_SYSTEM.active){
-        console.log('[HBSN] 20s timer fired but CAPTCHA active — skipping close');
-        return;
-      }
-      console.warn('[HBSN] ⏰ 20s auto-close — force closing task tab');
-      taskStatus('⏰ 20s timer — force closing…');
-      markSubmitted();
-      clearTaskHeartbeat();
-      releaseLock();
-      forceCloseTab();
-    },20000);
 
     window.addEventListener('beforeunload',()=>{ if(!done){ clearTaskHeartbeat(); releaseLock(); } });
 
