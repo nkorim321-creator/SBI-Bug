@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         HasanBhaierSalamNin36.0
 // @namespace    https://worker.mturk.com/
-// @version      33.8
-// @description  Queue processor. Strict 1-Tab Queue enforcement. No auto-reload. 26 strict return phrases. Processing lag fixed. Single task-tab enforced via heartbeat. Auto-captcha detect+alert+resume. 20s task-tab auto-close safety net.
+// @version      33.9
+// @description  Queue processor. Strict 1-Tab Queue enforcement. No auto-reload. 26 strict return phrases. Processing lag fixed. Single task-tab enforced via heartbeat. Auto-captcha detect+alert+resume. Amazon "Server Busy" auto-dismiss. 20s task-tab auto-close safety net.
 // @author       Custom Script
 // @match        https://worker.mturk.com/*
 // @match        https://*.mturk.com/*
@@ -147,6 +147,44 @@
   }
 
   /* ═══════════════════════════════════════
+     AMAZON SERVER-BUSY AUTO-DISMISS
+     Detects the "Server Busy / Continue shopping" interstitial that
+     Amazon shows when the HIT iframe URL is rate-limited, clicks
+     Continue, and closes the tab so the queue can move on.
+     Adapted from NMSH_VACUUM v19.
+  ═══════════════════════════════════════ */
+  function isServerBusyPage(){
+    if(!document.body) return false;
+    const title=(document.title||'').toLowerCase();
+    if(title.indexOf('server busy')>-1) return true;
+    const text=document.body.innerText||'';
+    return text.indexOf('Continue shopping')>-1;
+  }
+
+  let _serverBusyHandled=false;
+  function handleServerBusy(){
+    if(_serverBusyHandled) return true;
+    if(!isServerBusyPage()) return false;
+    _serverBusyHandled=true;
+    console.warn('[HBSN] Amazon "Server Busy" detected — auto-dismissing');
+    const els=document.querySelectorAll('input[type="submit"],button,a');
+    for(let i=0;i<els.length;i++){
+      if((els[i].textContent||els[i].value||'').indexOf('Continue')>-1){
+        try{els[i].click();}catch(e){}
+        break;
+      }
+    }
+    setTimeout(()=>{
+      try{markSubmitted();}catch(e){}
+      try{clearTaskHeartbeat();}catch(e){}
+      try{releaseLock();}catch(e){}
+      try{window.close();}catch(e){}
+      setTimeout(()=>{try{location.href='https://worker.mturk.com/dashboard';}catch(e){}},500);
+    },1000);
+    return true;
+  }
+
+  /* ═══════════════════════════════════════
      CAPTCHA SYSTEM (auto-detect / alert / resume)
      Adapted from NMSH_VACUUM v19
   ═══════════════════════════════════════ */
@@ -162,6 +200,7 @@
     },
     hasCaptchaOnPage(){
       if(!document.body) return false;
+      if(isServerBusyPage()) return false; // suppress false positive on Amazon "Server Busy" page
       if(document.querySelector('img[src*="captcha" i],iframe[src*="recaptcha"],.g-recaptcha,.recaptcha-checkbox-border,input[name="captchacharacters"],form[action*="captcha" i]')) return true;
       return /captchacharacters|CaptchaInput|validateCaptcha|opfcaptcha/i.test(document.body.innerHTML||'');
     },
@@ -432,6 +471,17 @@
      PAGE ROUTING & SINGLE TAB MANAGER
   ═══════════════════════════════════════ */
   seedDefaultDB();
+
+  /* ★ Run Amazon "Server Busy" auto-dismiss before anything else.
+     Polls briefly to catch late-rendering Amazon interstitials. */
+  (function initServerBusyHandler(){
+    if(handleServerBusy()) return;
+    document.addEventListener('DOMContentLoaded',handleServerBusy);
+    let polls=0;
+    const t=setInterval(()=>{
+      if(handleServerBusy() || ++polls>20) clearInterval(t);
+    },300);
+  })();
 
   const url     = location.href;
   const inFrame = window.self !== window.top;
