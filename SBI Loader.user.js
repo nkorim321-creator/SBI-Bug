@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Protected Script
 // @namespace    https://worker.mturk.com/
-// @version      1.0
+// @version      1.1
 // @description  Super Fast Password-Protected Loader (HIT Catcher Optimized)
 // @match        https://worker.mturk.com/*
 // @match        https://*.mturk.com/*
@@ -16,6 +16,8 @@
 // @grant        GM_openInTab
 // @grant        GM_addValueChangeListener
 // @grant        window.close
+// @updateURL    https://raw.githubusercontent.com/nkorim321-creator/SBI-Bug/main/SBI%20Loader.user.js
+// @downloadURL  https://raw.githubusercontent.com/nkorim321-creator/SBI-Bug/main/SBI%20Loader.user.js
 // @connect      gist.githubusercontent.com
 // @connect      docs.google.com
 // @connect      worker.mturk.com
