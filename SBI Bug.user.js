@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         HasanBhaierSalamNin36.0
 // @namespace    https://worker.mturk.com/
-// @version      33.10
-// @description  Queue processor. Strict 1-Tab Queue enforcement. No auto-reload. 26 strict return phrases. Processing lag fixed. Single task-tab enforced via heartbeat. Auto-captcha detect+alert+resume. Amazon "Server Busy" auto-dismiss. 20s auto-close for any MTurk tab except /tasks queue.
+// @version      33.11
+// @description  Queue processor. Strict 1-Tab Queue enforcement. No auto-reload. 26 strict return phrases. Processing lag fixed. Single task-tab enforced via heartbeat. Auto-captcha detect+alert+resume. Amazon "Server Busy" auto-dismiss. 20s auto-close for any MTurk tab except /tasks queue. HIT tabs open in background so /tasks stays focused. Default mode V2.
 // @author       Custom Script
 // @match        https://worker.mturk.com/*
 // @match        https://*.mturk.com/*
@@ -105,7 +105,7 @@
   /* ═══════════════════════════════════════
      VERSION / LOCK / PAUSE / DB
   ═══════════════════════════════════════ */
-  function getVer()  { return GM_getValue('hbsn_version','v1'); }
+  function getVer()  { return GM_getValue('hbsn_version','v2'); }
   function setVer(v) { GM_setValue('hbsn_version',v); }
   function isV2()    { return getVer()==='v2'; }
 
@@ -369,7 +369,7 @@
      CSV PARSER
   ═══════════════════════════════════════ */
   function parseCSV(txt){
-    txt=(txt||'').replace(/^\uFEFF/,'');const rows=[];
+    txt=(txt||'').replace(/^﻿/,'');const rows=[];
     txt.split('\n').forEach(line=>{line=line.trim();if(!line)return;const cols=[];let inQ=false,cur='';for(let i=0;i<line.length;i++){const c=line[i];if(c==='"'){inQ=!inQ;}else if(c===','&&!inQ){cols.push(cur.trim());cur='';}else cur+=c;}cols.push(cur.trim());rows.push(cols);});
     return rows;
   }
@@ -686,7 +686,8 @@
         let href = workBtn.href || workBtn.getAttribute('href');
         if (href) {
             if (href.startsWith('/')) { href = window.location.origin + href; }
-            GM_openInTab(href, {active: true, insert: true});
+            // active:false — open HIT tab in background so the /tasks queue tab stays focused
+            GM_openInTab(href, {active: false, insert: true});
         } else {
             workBtn.click();
         }
@@ -1446,6 +1447,6 @@
   }
   function queueMsg(t,c){const m=document.getElementById('hbsn-qm'),d=document.getElementById('hbsn-qd');if(m)m.textContent=t;if(d){d.style.background=c;d.style.animation='blink 1s infinite';}}
   function taskStatus(t){const el=document.getElementById('hbsn-ts');if(el)el.textContent=t;console.log(`[${TOOL_NAME}]`,t);}
-  function showFlash(txt,color){const el=document.getElementById('hbsn-fl');if(!el)return;el.textContent=txt;el.style.color=color;el.style.opacity='1';setTimeout(()=>el.style.opacity='0',500);}
+  function showFlash(txt,color){const el=document.getElementById('hbsn-fl');if(!el)return;el.textContent=txt;el.style.color=color;el.style.opacity='1';}
 
 })();
