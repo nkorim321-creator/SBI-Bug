@@ -28,7 +28,7 @@
   'use strict';
 
   // Gist RAW link to the encrypted payload
-  const PAYLOAD_URL = 'https://gist.github.com/nkorim321-creator/13f1e8c6fe7001060a304823e54baf48/raw/gistfile1.txt';
+  const PAYLOAD_URL = 'https://gist.github.com/nkorim321-creator/ced6f72c81fa5368370b6e549bcdb920/raw/8.6.26.json';
   const PASS_KEY    = 'sbi_loader_pass';
   const MAX_TRIES   = 3;
 
