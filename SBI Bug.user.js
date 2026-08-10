@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         HasanBhaierSalamNin36.0
 // @namespace    https://worker.mturk.com/
-// @version      33.11
-// @description  Queue processor. Strict 1-Tab Queue enforcement. No auto-reload. 26 strict return phrases. Processing lag fixed. Single task-tab enforced via heartbeat. Auto-captcha detect+alert+resume. Amazon "Server Busy" auto-dismiss. 20s auto-close for any MTurk tab except /tasks queue. HIT tabs open in background so /tasks stays focused. Default mode V2.
+// @version      33.12
+// @description  Queue processor. Strict 1-Tab Queue enforcement. No auto-reload. 26 strict return phrases. Processing lag fixed. Single task-tab enforced via heartbeat. Auto-captcha detect+alert+resume. Amazon "Server Busy" auto-dismiss. 20s auto-close for any MTurk tab except /tasks queue. HIT tabs open in background so /tasks stays focused. Default mode V2. Google Sheet Worker ID allowlist enforced on queue + task pages.
 // @author       Custom Script
 // @match        https://worker.mturk.com/*
 // @match        https://*.mturk.com/*
@@ -602,7 +602,12 @@
   if(!inFrame && isQueuePage()){
     if (!manageQueueSingleton()) return;
 
-    if(document.body) runQueue(); else document.addEventListener('DOMContentLoaded', runQueue);
+    // ★ Google Sheet Worker ID allowlist — block queue processing if not authorized
+    const startQueue = () => gate(runQueue, () => {
+      console.warn('[HBSN] Worker ID not authorized — queue disabled');
+    });
+    if(document.body) startQueue();
+    else document.addEventListener('DOMContentLoaded', startQueue);
     return;
   }
 
@@ -610,7 +615,15 @@
   if(!inFrame && isTaskPage() && isOurTab){
     // ★ Enforce single task tab before running
     if (!manageTaskSingleton()) return;
-    runParent();
+
+    // ★ Google Sheet Worker ID allowlist — block HIT processing if not authorized
+    const startTask = () => gate(runParent, () => {
+      console.warn('[HBSN] Worker ID not authorized — task disabled, releasing lock');
+      clearTaskHeartbeat();
+      releaseLock();
+    });
+    if(document.body) startTask();
+    else document.addEventListener('DOMContentLoaded', startTask);
     return;
   }
   // ★ IFRAME: poll for parent signal instead of one-shot check
