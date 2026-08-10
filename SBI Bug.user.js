@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HasanBhaierSalamNin36.0
 // @namespace    https://worker.mturk.com/
-// @version      33.13
+// @version      33.14
 // @description  Queue processor. Strict 1-Tab Queue enforcement. No auto-reload. 26 strict return phrases. Processing lag fixed. Single task-tab enforced via heartbeat. Auto-captcha detect+alert+resume. Amazon "Server Busy" auto-dismiss. 20s auto-close for any MTurk tab except /tasks queue. HIT tabs open in background so /tasks stays focused. Default mode V2. Google Sheet Worker ID allowlist enforced on queue + task pages.
 // @author       Custom Script
 // @match        https://worker.mturk.com/*
@@ -399,30 +399,15 @@
   function injectAuthCSS(){
     if(document.getElementById('hbsn-auth-css'))return;
     const s=document.createElement('style');s.id='hbsn-auth-css';
+    // Only the small auth-badge (bottom-right during verify) needs CSS.
+    // The block/revoked banners set their styles inline in _showAuthBanner.
     s.textContent=`
       #hbsn-auth-badge{position:fixed;bottom:16px;right:16px;z-index:2147483647;background:rgba(10,10,10,.95);border:1px solid #2a2a2a;border-radius:10px;padding:10px 14px;font-family:'Segoe UI',system-ui,sans-serif;backdrop-filter:blur(6px);box-shadow:0 4px 20px rgba(0,0,0,.8);min-width:170px;text-align:center}
       .hb-logo{font:900 11px system-ui;color:#f59e0b;letter-spacing:1px}
       .hb-ver{font:600 8px system-ui;color:#444;letter-spacing:2px;margin-bottom:6px}
       .hb-wid{font:800 11px Consolas,monospace;color:#f59e0b;margin-bottom:4px;min-height:14px}
-      .hb-st{font:600 9px system-ui;min-height:12px}
-      #hbsn-block-screen,#hbsn-revoked{position:fixed;top:0;left:0;width:100%;height:100%;background:linear-gradient(135deg,#080808,#0f172a);z-index:2147483647;display:flex;align-items:center;justify-content:center;font-family:'Segoe UI',system-ui,sans-serif}
-      .hb-box{background:#0f0f0f;border:1px solid #1e1e1e;border-radius:14px;padding:36px 44px;text-align:center;width:420px;box-shadow:0 30px 80px rgba(0,0,0,.9)}
-      .hb-logo-lg{font:900 18px system-ui;color:#ef4444;letter-spacing:2px;margin-bottom:4px}
-      .hb-sub{font:700 9px system-ui;color:#333;letter-spacing:3px;margin-bottom:14px;text-transform:uppercase}
-      .hb-clock{font:900 42px/1 Consolas,monospace;color:#22c55e;letter-spacing:4px;margin-bottom:5px}
-      .hb-date{font:600 11px system-ui;color:#444;margin-bottom:20px}
-      .hb-sep{height:1px;background:linear-gradient(90deg,transparent,#222,transparent);margin-bottom:20px}
-      .hb-wid-lg{font:900 15px Consolas,monospace;color:#ef4444;letter-spacing:3px;margin-bottom:14px}
-      .hb-msg{font:600 11px system-ui;color:#94a3b8;line-height:1.7;margin-bottom:8px}
-      .hb-footer{font:600 8px system-ui;color:#2a2a2a;margin-top:18px}`;
+      .hb-st{font:600 9px system-ui;min-height:12px}`;
     (document.head||document.documentElement).appendChild(s);
-  }
-
-  let _clockTimer=null;
-  function _startClock(prefix){
-    if(_clockTimer){clearInterval(_clockTimer);_clockTimer=null;}
-    function tick(){const d=new Date(),p2=n=>String(n).padStart(2,'0'),days=['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'],mons=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'],clk=document.getElementById(prefix+'-clk'),dt=document.getElementById(prefix+'-dt');if(clk)clk.textContent=p2(d.getHours())+':'+p2(d.getMinutes())+':'+p2(d.getSeconds());if(dt)dt.textContent=days[d.getDay()]+', '+mons[d.getMonth()]+' '+d.getDate()+' '+d.getFullYear();}
-    tick();_clockTimer=setInterval(tick,1000);
   }
 
   function showBadge(wid){removeBadge();if(!document.body)return;const b=document.createElement('div');b.id='hbsn-auth-badge';const masked=wid?wid.substring(0,4)+'***'+wid.substring(wid.length-3):'Detecting…';b.innerHTML=`<div class="hb-logo">${TOOL_NAME}</div><div class="hb-ver">v${VERSION}</div><div class="hb-wid" id="hbsn-badge-wid">${masked}</div><div class="hb-st" id="hbsn-badge-st" style="color:#f39c12">Checking…</div>`;document.body.appendChild(b);}
@@ -453,14 +438,13 @@
 
   function showBlockScreen(wid, msg) {
     removeBadge();
-    const masked = wid ? wid.substring(0,4)+'***'+wid.substring(wid.length-3) : '?';
     _showAuthBanner('hbsn-block-screen',
-      `⛔ ${TOOL_NAME}: Worker ID ${masked} is NOT authorized to use this script. ${msg || 'Contact the admin.'}`);
+      `⛔ ${TOOL_NAME}: You are NOT authorized to use this script. ${msg || 'Contact the admin.'}`);
   }
 
   function showRevokedScreen() {
     _showAuthBanner('hbsn-revoked',
-      `🚫 ${TOOL_NAME}: Your Worker ID access has been REVOKED. Contact the admin.`);
+      `🚫 ${TOOL_NAME}: Your access has been REVOKED. Contact the admin.`);
   }
 
   function showCheckingBadge(savedId){
