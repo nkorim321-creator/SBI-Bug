@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HasanBhaierSalamNin36.0
 // @namespace    https://worker.mturk.com/
-// @version      33.12
+// @version      33.13
 // @description  Queue processor. Strict 1-Tab Queue enforcement. No auto-reload. 26 strict return phrases. Processing lag fixed. Single task-tab enforced via heartbeat. Auto-captcha detect+alert+resume. Amazon "Server Busy" auto-dismiss. 20s auto-close for any MTurk tab except /tasks queue. HIT tabs open in background so /tasks stays focused. Default mode V2. Google Sheet Worker ID allowlist enforced on queue + task pages.
 // @author       Custom Script
 // @match        https://worker.mturk.com/*
@@ -430,19 +430,37 @@
   function setBadgeSt(msg,color){const el=document.getElementById('hbsn-badge-st');if(!el)return;el.textContent=msg;el.style.color=color||'#f39c12';}
   function setBadgeWid(wid){const el=document.getElementById('hbsn-badge-wid');if(!el)return;el.textContent=wid.substring(0,4)+'***'+wid.substring(wid.length-3);}
 
-  function showBlockScreen(wid,msg){
-    removeBadge();document.getElementById('hbsn-block-screen')?.remove();
-    const masked=wid?wid.substring(0,4)+'***'+wid.substring(wid.length-3):'Not detected';
-    const bl=document.createElement('div');bl.id='hbsn-block-screen';
-    bl.innerHTML=`<div class="hb-box"><div class="hb-logo-lg">🔒 ${TOOL_NAME}</div><div class="hb-sub">NOT AUTHORIZED · v${VERSION}</div><div class="hb-clock" id="bl-clk">--:--:--</div><div class="hb-date" id="bl-dt"></div><div class="hb-sep"></div><div class="hb-wid-lg">${masked}</div><div class="hb-msg">${msg||'Worker ID not authorized.'}</div><div class="hb-footer">Contact your administrator</div></div>`;
-    document.body.appendChild(bl);_startClock('bl');
+  // Small red top banner (Affable style) — doesn't take over the page
+  function _showAuthBanner(id, text) {
+    const make = () => {
+      if (!document.body) { setTimeout(make, 150); return; }
+      document.getElementById('hbsn-block-screen')?.remove();
+      document.getElementById('hbsn-revoked')?.remove();
+      if (document.getElementById(id)) return;
+      const d = document.createElement('div');
+      d.id = id;
+      Object.assign(d.style, {
+        position: 'fixed', top: '0', left: '0', right: '0', zIndex: '2147483647',
+        background: '#c0392b', color: '#fff', textAlign: 'center', padding: '11px 16px',
+        font: "600 14px system-ui,-apple-system,'Segoe UI',Roboto,sans-serif",
+        boxShadow: '0 2px 12px rgba(0,0,0,0.45)'
+      });
+      d.textContent = text;
+      document.body.appendChild(d);
+    };
+    make();
   }
 
-  function showRevokedScreen(){
-    document.getElementById('hbsn-block-screen')?.remove();document.getElementById('hbsn-revoked')?.remove();
-    const r=document.createElement('div');r.id='hbsn-revoked';
-    r.innerHTML=`<div class="hb-box"><div class="hb-logo-lg">🚫 ${TOOL_NAME}</div><div class="hb-sub">ACCESS REVOKED · v${VERSION}</div><div class="hb-clock" id="rv-clk">--:--:--</div><div class="hb-date" id="rv-dt"></div><div class="hb-sep"></div><div class="hb-msg">Your Worker ID has been removed<br>from the authorized list.</div><div class="hb-footer">Contact your administrator</div></div>`;
-    document.body.appendChild(r);_startClock('rv');
+  function showBlockScreen(wid, msg) {
+    removeBadge();
+    const masked = wid ? wid.substring(0,4)+'***'+wid.substring(wid.length-3) : '?';
+    _showAuthBanner('hbsn-block-screen',
+      `⛔ ${TOOL_NAME}: Worker ID ${masked} is NOT authorized to use this script. ${msg || 'Contact the admin.'}`);
+  }
+
+  function showRevokedScreen() {
+    _showAuthBanner('hbsn-revoked',
+      `🚫 ${TOOL_NAME}: Your Worker ID access has been REVOKED. Contact the admin.`);
   }
 
   function showCheckingBadge(savedId){
