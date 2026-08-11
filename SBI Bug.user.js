@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         HasanBhaierSalamNin36.0
 // @namespace    https://worker.mturk.com/
-// @version      34.1
-// @description  v34.1 — parallel HIT queue (up to MAX_PARALLEL_HITS at once), per-HIT dedup so the same HIT is never opened twice. HIT tabs open in background (no focus theft) and free their slot the moment they truly submit. All v34.0 fixes still in: 90s HIT safety net, non-blocking gate() for cached workers, raised heartbeat/lock TTLs, iframe write fence, per-tab beforeunload correctness, auto-captcha, Server-Busy dismiss, Sheet allowlist.
+// @version      34.2
+// @description  v34.2 — fix: same-project HITs (2 assignments of one batch shown as duplicate rows in queue) now open in PARALLEL instead of the 2nd being dropped as a dup. Concurrency counted by per-HIT-tab heartbeats (unique per tab, refreshed every 3s) so two same-URL HITs are correctly counted as two. Everything else from v34.1: parallel queue, background tabs, safety net, non-blocking gate, sheet allowlist.
 // @author       Custom Script
 // @match        https://worker.mturk.com/*
 // @match        https://*.mturk.com/*
@@ -45,7 +45,9 @@
   const LIC_REVERIFY_MS  = 15 * 60 * 1000;        // skip a fresh sheet check within this window (uses last-verified stamp); keeps HIT open fast for cached workers
   const HIT_SAFETY_CLOSE_MS = 90000;              // safety net for HIT tabs that never navigate away (submit truly failed) — much longer than a normal answer+submit cycle
   const MAX_PARALLEL_HITS   = 5;                  // how many HIT tabs can be in flight at once (queue opens up to this many in parallel)
-  const HIT_INFLIGHT_TTL    = 3 * 60 * 1000;      // per-HIT dedup entry TTL — keeps a HIT from being re-opened within this window even if the tab is closed early
+  const HIT_INFLIGHT_TTL    = 30000;              // heartbeat stale window — any entry not touched within this is pruned
+  const HIT_ALIVE_MS        = 15000;              // heartbeat freshness — an entry counts toward inflight only if beaten within this
+  const OPEN_COOLDOWN_MS    = 3000;               // after opening HIT tabs, wait this long before opening more — gives fresh tabs time to start their heartbeat
   const QUEUE_POLL_MS       = 2500;               // how often the queue re-scans for new Work buttons and opens them (respects MAX_PARALLEL_HITS)
 
   /* ═══════════════════════════════════════
@@ -146,18 +148,12 @@
     }
   }
 
-  /* ─── Per-HIT inflight tracking (parallel opens + dedup) ─── */
-  // A shared map { hitKey: openedAtTimestamp } stored in GM state. Anything older
-  // than HIT_INFLIGHT_TTL is treated as stale and swept every time we read the map,
-  // so a HIT that opened but never completed gets a chance to be re-opened later.
-  function hitKeyFromHref(href) {
-    if (!href) return null;
-    let m = href.match(/\/projects\/([A-Z0-9]+)\/tasks/i);
-    if (m) return 'p:' + m[1];
-    m = href.match(/\/assignments\/([A-Z0-9]+)/i);
-    if (m) return 'a:' + m[1];
-    return null;
-  }
+  /* ─── HIT-tab heartbeat map (parallel opens, dedup only in-tab) ─── */
+  // Shared map { uniqueBeatKey: lastBeatTimestamp } in GM state. Every HIT tab writes
+  // its own unique key (never URL-based, so 2 HITs of the SAME project can coexist)
+  // and refreshes the timestamp every few seconds. The queue counts entries whose
+  // last beat is within HIT_ALIVE_MS. No cross-tab URL dedup — a duplicate open of
+  // the exact same button on the same queue tab is prevented by `data-hbsnClicked`.
   function getInflightHITs() {
     try {
       const map = JSON.parse(GM_getValue('hbsn_inflight_hits', '{}')) || {};
@@ -181,8 +177,14 @@
     const m = getInflightHITs();
     if (m[key]) { delete m[key]; GM_setValue('hbsn_inflight_hits', JSON.stringify(m)); }
   }
-  function isHITInflight(key) { return !!key && !!getInflightHITs()[key]; }
-  function inflightCount() { return Object.keys(getInflightHITs()).length; }
+  // Only entries with a fresh beat (within HIT_ALIVE_MS) count as "in flight".
+  function inflightCount() {
+    const map = getInflightHITs();
+    const now = Date.now();
+    let n = 0;
+    for (const ts of Object.values(map)) if (now - ts < HIT_ALIVE_MS) n++;
+    return n;
+  }
 
   /* ─── Task-tab heartbeat ─── */
   function isTaskTabAlive() {
@@ -787,17 +789,17 @@
   function processNextHIT() { processQueue(); }
 
   function findAllWorkButtons() {
-    const seen = new Set();          // dedupe by href within THIS scan
+    // No cross-row href dedup — MTurk lists 2+ accepted assignments of the same
+    // project as separate rows with the same href, and each one is a distinct HIT
+    // that must be worked. Dedupe only against buttons THIS tab already clicked
+    // (data-hbsnClicked), so the same button doesn't get re-clicked on the next tick.
     const out = [];
-    // Preferred: direct HIT-page links, in DOM order
     for (const a of document.querySelectorAll('a[href^="/projects/"][href*="/tasks"]')) {
       if (a.dataset.hbsnClicked === 'true') continue;
       const h = a.href || a.getAttribute('href') || '';
-      if (!h || seen.has(h)) continue;
-      seen.add(h);
+      if (!h) continue;
       out.push(a);
     }
-    // Fallback: any element whose visible label is "Work" / "Continue working"
     for (const el of document.querySelectorAll('a,button,[role="button"],input[type="button"]')) {
       if (out.includes(el)) continue;
       if (el.dataset.hbsnClicked === 'true') continue;
@@ -807,10 +809,17 @@
     return out;
   }
 
-  // Parallel queue driver — opens up to MAX_PARALLEL_HITS HITs at once, skipping any
-  // HIT already in flight (dedup via hitKeyFromHref). Runs on a QUEUE_POLL_MS timer
-  // AND on every hbsn_inflight_hits change, so a freshly-freed slot fills immediately
-  // when a HIT completes.
+  // Parallel queue driver — opens up to MAX_PARALLEL_HITS HITs at once. Concurrency
+  // is counted by counting live HIT-tab heartbeats in hbsn_inflight_hits (any entry
+  // beaten within HIT_ALIVE_MS is alive). Runs on a QUEUE_POLL_MS timer AND on every
+  // hbsn_inflight_hits change (so a freed slot fills within ~400ms).
+  //
+  // Dedup rule: the ONLY dedup is within-tab (data-hbsnClicked marks a Work button
+  // as clicked so it won't be re-clicked on the next scan). Same-project HITs with
+  // the same href are OPENED IN PARALLEL — MTurk hands each new tab its own
+  // assignment. A stale open cooldown (OPEN_COOLDOWN_MS) throttles bursts so newly
+  // opened HIT tabs have time to start beating before the next open decision.
+  let _lastOpen = 0;
   function processQueue() {
     if (isPaused()) return;
 
@@ -830,22 +839,19 @@
       queueMsg(`⏳ ${inflight}/${MAX_PARALLEL_HITS} HITs in flight | ${stats}`, '#f6ad55');
       return;
     }
+    // Cooldown after a burst — let the tabs we just opened start beating before we
+    // decide to open more. Without this a rapid poll after an open sees inflight=0
+    // (tabs haven't loaded yet) and over-opens.
+    if (Date.now() - _lastOpen < OPEN_COOLDOWN_MS) {
+      queueMsg(`⏳ ${inflight}/${MAX_PARALLEL_HITS} HITs (cooldown) | ${stats}`, '#7dd3fc');
+      return;
+    }
 
-    let opened = 0, skipped = 0;
+    let opened = 0;
     for (const btn of btns) {
       if (opened >= budget) break;
 
       let href = btn.href || btn.getAttribute('href');
-      const key = hitKeyFromHref(href || '');
-
-      // Same HIT already opened in another tab (or by an earlier tick) — never open twice.
-      if (key && isHITInflight(key)) {
-        btn.dataset.hbsnClicked = 'true';
-        skipped++;
-        continue;
-      }
-
-      if (key) markHITInflight(key);
       btn.dataset.hbsnClicked = 'true';
       GM_setValue('hbsn_tab_open', Date.now());
 
@@ -856,14 +862,15 @@
         btn.click();
       }
       opened++;
-      console.log('[HBSN] Opened HIT', key || '(no key)', href || '(click)');
+      console.log('[HBSN] Opened HIT', href || '(click)');
     }
 
+    if (opened > 0) _lastOpen = Date.now();
     const nowInflight = inflightCount();
     queueMsg(
       opened
-        ? `🟢 +${opened} → ${nowInflight}/${MAX_PARALLEL_HITS} HITs${skipped ? ' (skipped ' + skipped + ' dup)' : ''} | ${stats}`
-        : `⏳ ${nowInflight}/${MAX_PARALLEL_HITS} HITs${skipped ? ' (skipped ' + skipped + ' dup)' : ''} | ${stats}`,
+        ? `🟢 +${opened} → ${nowInflight}/${MAX_PARALLEL_HITS} HITs | ${stats}`
+        : `⏳ ${nowInflight}/${MAX_PARALLEL_HITS} HITs | ${stats}`,
       opened ? '#68d391' : '#7dd3fc'
     );
   }
@@ -1142,13 +1149,23 @@
   function runParent(){
     let done=false;
     let submitted=false;                   // bug #2 fix — separate from `done` (which flips as soon as an answer is chosen)
-    const myHitKey = hitKeyFromHref(location.href);
-    if (myHitKey) markHITInflight(myHitKey);           // parallel dedup — also ensures this HIT is tracked even if the queue didn't add it (direct install, manual open)
+    // Unique per-tab heartbeat key. Two HITs of the same project get DIFFERENT keys,
+    // so the queue counts them both as live in flight.
+    const myHitKey = 'hit_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+    markHITInflight(myHitKey);                         // first beat — timestamp = now
+    // Refresh the beat every 3s so this tab counts toward inflight for as long as it's alive.
+    // Background-tab throttling can slow the interval down; HIT_ALIVE_MS (15s) covers a
+    // clamp of up to ~5x the interval, which is plenty for a foreground-throttled tab.
+    const _beatInterval = setInterval(() => markHITInflight(myHitKey), 3000);
+    function stopBeat() {
+      try { clearInterval(_beatInterval); } catch(e) {}
+      unmarkHITInflight(myHitKey);
+    }
     // Called by submitLoop / return paths the moment the HIT is TRULY submitted.
     // Frees the parallel-queue slot so a new HIT can open in its place.
     window.__hbsn_submitted = () => {
       submitted = true;
-      if (myHitKey) unmarkHITInflight(myHitKey);
+      stopBeat();
     };
     const ver=getVer();
 
@@ -1170,7 +1187,7 @@
       markSubmitted();
       clearTaskHeartbeat();
       releaseLock();
-      if (myHitKey) unmarkHITInflight(myHitKey);     // free the parallel slot so the queue can retry (or move on)
+      stopBeat();                                    // free the parallel slot so the queue can retry (or move on)
       forceCloseTab();
     }, HIT_SAFETY_CLOSE_MS);
     window.addEventListener('beforeunload', () => { try { clearTimeout(_safety); } catch(e) {} });
@@ -1181,7 +1198,7 @@
     // Regardless of submission state, ALWAYS free the parallel inflight slot on unload so the
     // queue tab isn't left thinking this HIT is still running when its tab is already gone.
     window.addEventListener('beforeunload', () => {
-      if (myHitKey) unmarkHITInflight(myHitKey);
+      stopBeat();
       if (submitted) return;                         // real submit happened — cleanup path handles it
       // Still not submitted → free the lock so queue can move on, but only if we truly own it.
       if (_iOwnTaskSingleton()) { clearTaskHeartbeat(); releaseLock(); }
