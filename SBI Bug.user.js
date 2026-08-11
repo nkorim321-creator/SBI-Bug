@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         HasanBhaierSalamNin36.0
 // @namespace    https://worker.mturk.com/
-// @version      33.14
-// @description  Queue processor. Strict 1-Tab Queue enforcement. No auto-reload. 26 strict return phrases. Processing lag fixed. Single task-tab enforced via heartbeat. Auto-captcha detect+alert+resume. Amazon "Server Busy" auto-dismiss. 20s auto-close for any MTurk tab except /tasks queue. HIT tabs open in background so /tasks stays focused. Default mode V2. Google Sheet Worker ID allowlist enforced on queue + task pages.
+// @version      34.0
+// @description  Fixes v34 — HIT tabs no longer auto-closed at 20s (they now get a 90s safety net); gate() is non-blocking for cached workers (fresh sheet check runs in background); heartbeat/lock TTLs raised to survive Chrome background-tab throttling; iframe lock/heartbeat writes fenced off; beforeunload releases lock only when submission truly never started; cleanup helpers now clear singleton + interval; queue stale-lock polled every 5s. Queue processor. Strict 1-Tab Queue enforcement. Auto-captcha detect+alert+resume. Amazon "Server Busy" auto-dismiss. Default mode V2. Google Sheet Worker ID allowlist enforced.
 // @author       Custom Script
 // @match        https://worker.mturk.com/*
 // @match        https://*.mturk.com/*
@@ -39,9 +39,11 @@
   const SUBMIT_RETRY_MS  = 300;
   const RETRY_MS         = 200;
   const YES_PERCENT      = 60;
-  const STALE_LOCK_MS    = 25000;
+  const STALE_LOCK_MS    = 180000;                // raised — HIT tabs run in background, Chrome throttles timers, so a lock legitimately held for 30-60s must not be reaped
   const ANSWER_RETRIES   = 20;
-  const TASK_TAB_HEARTBEAT_TTL = 8000; // task tab considered alive if heartbeat < 8s old
+  const TASK_TAB_HEARTBEAT_TTL = 90000;           // raised — background-tab timer throttling can clamp the 2s heartbeat, TTL must survive Chrome's ~1min clamp
+  const LIC_REVERIFY_MS  = 15 * 60 * 1000;        // skip a fresh sheet check within this window (uses last-verified stamp); keeps HIT open fast for cached workers
+  const HIT_SAFETY_CLOSE_MS = 90000;              // safety net for HIT tabs that never navigate away (submit truly failed) — much longer than a normal answer+submit cycle
 
   /* ═══════════════════════════════════════
      STRICT 26 RETURN TEXTS
@@ -87,10 +89,21 @@
   }
 
   const LIC = {
-    isLocalValid() { try { const s=JSON.parse(GM_getValue(LIC_KEY,'{}'));return !!(s&&s.mk&&s.mk===monthKey()&&s.workerId); } catch(e){return false;} },
-    savedWorkerId() { try{return JSON.parse(GM_getValue(LIC_KEY,'{}')).workerId||'';}catch(e){return '';} },
-    save(wid) { GM_setValue(LIC_KEY,JSON.stringify({workerId:wid.toUpperCase().trim(),mk:monthKey(),at:Date.now()})); },
-    clear() { GM_setValue(LIC_KEY,'{}'); }
+    _read() { try { return JSON.parse(GM_getValue(LIC_KEY,'{}')) || {}; } catch(e) { return {}; } },
+    _write(o) { try { GM_setValue(LIC_KEY, JSON.stringify(o)); } catch(e) {} },
+    isLocalValid() { const s = this._read(); return !!(s && s.mk && s.mk === monthKey() && s.workerId); },
+    savedWorkerId() { return this._read().workerId || ''; },
+    lastVerifiedAt() { return this._read().lastVerifiedAt || 0; },
+    save(wid) {
+      const now = Date.now();
+      this._write({ workerId: wid.toUpperCase().trim(), mk: monthKey(), at: now, lastVerifiedAt: now });
+    },
+    markVerified() {
+      const s = this._read();
+      s.lastVerifiedAt = Date.now();
+      this._write(s);
+    },
+    clear() { GM_setValue(LIC_KEY, '{}'); }
   };
 
   /* ═══════════════════════════════════════
@@ -110,15 +123,27 @@
   function isV2()    { return getVer()==='v2'; }
 
   function isLocked()    { return GM_getValue('hbsn_lock',0)===1; }
+  function touchLock()   { GM_setValue('hbsn_lock_ts', Date.now()); }   // extend the lock's stale-timer during long work
   function acquireLock() { GM_setValue('hbsn_lock',1); GM_setValue('hbsn_lock_ts',Date.now()); }
-  function releaseLock() { GM_setValue('hbsn_lock',0); }
+  // Only the tab that OWNS the active task should be able to release the lock and clear the singleton.
+  // Prevents an iframe or a stray beforeunload from wiping a lock the real HIT-processing tab still holds.
+  function _iOwnTaskSingleton() {
+    const my = (typeof sessionStorage !== 'undefined') ? sessionStorage.getItem('hbsn_task_tab_id') : null;
+    const active = GM_getValue('hbsn_active_task_id', '');
+    return !!(my && active && my === active);
+  }
+  function releaseLock() {
+    GM_setValue('hbsn_lock', 0);
+    // Clear singleton ownership so a fresh task tab can claim cleanly (bug #13 fix).
+    if (_iOwnTaskSingleton()) GM_setValue('hbsn_active_task_id', '');
+  }
   function checkStaleLock() {
     if (isLocked() && (Date.now()-GM_getValue('hbsn_lock_ts',0))>STALE_LOCK_MS) {
       console.warn('[HBSN] Stale lock — releasing'); releaseLock();
     }
   }
 
-  /* ─── Task-tab heartbeat (NEW) ─── */
+  /* ─── Task-tab heartbeat ─── */
   function isTaskTabAlive() {
     const lastBeat = GM_getValue('hbsn_task_heartbeat', 0);
     return (Date.now() - lastBeat) < TASK_TAB_HEARTBEAT_TTL;
@@ -127,11 +152,18 @@
   function startTaskHeartbeat() {
     if(_hbInterval)clearInterval(_hbInterval);
     GM_setValue('hbsn_task_heartbeat', Date.now());
-
-        _hbInterval=setInterval(() => { GM_setValue('hbsn_task_heartbeat', Date.now()); }, 2000);
+    touchLock();
+    // Every 2s the heartbeat also refreshes hbsn_lock_ts so the stale-lock reaper never trips a live tab.
+    _hbInterval=setInterval(() => {
+      GM_setValue('hbsn_task_heartbeat', Date.now());
+      touchLock();
+    }, 2000);
   }
   function clearTaskHeartbeat() {
+    // Also stop the interval so a background-throttled tick can't overwrite the cleared timestamp (bug #12).
+    if (_hbInterval) { clearInterval(_hbInterval); _hbInterval = null; }
     GM_setValue('hbsn_task_heartbeat', 0);
+    if (_iOwnTaskSingleton()) GM_setValue('hbsn_active_task_id', '');
   }
 
   function isPaused() { return GM_getValue('hbsn_paused',false); }
@@ -165,6 +197,13 @@
   function handleServerBusy(){
     if(_serverBusyHandled) return true;
     if(!isServerBusyPage()) return false;
+    // Never mutate shared GM state from inside an iframe — the top-level HIT tab may still be working (bug #2 fix).
+    if(window.self !== window.top){
+      _serverBusyHandled = true;
+      console.warn('[HBSN] Server Busy detected inside iframe — signalling parent, not touching shared state');
+      try { window.top.postMessage({ type: 'HBSN_SERVER_BUSY' }, '*'); } catch(e) {}
+      return true;
+    }
     _serverBusyHandled=true;
     console.warn('[HBSN] Amazon "Server Busy" detected — auto-dismissing');
     const els=document.querySelectorAll('input[type="submit"],button,a');
@@ -186,14 +225,21 @@
 
   /* ═══════════════════════════════════════
      GENERAL MTURK TAB AUTO-CLOSE (20s)
-     Closes ANY MTurk tab that isn't the /tasks queue page after
-     20 seconds. Skips iframes and pauses if a CAPTCHA is active.
+     Closes MTurk tabs that are NOT the /tasks queue page AND NOT HIT
+     working pages, after 20 seconds. HIT pages get their own longer
+     safety timer inside runParent — the 20s window was too short and
+     was killing HITs mid-submit (bug #1).
   ═══════════════════════════════════════ */
   function isMTurkQueueTab(){
     const u=location.href;
     if(u.includes('/projects/')||u.includes('/assignments/')) return false;
     return u.includes('worker.mturk.com/queue') || u.includes('worker.mturk.com/tasks')
         || u==='https://worker.mturk.com/' || u==='https://worker.mturk.com';
+  }
+  function isMTurkHITTab(){
+    const u = location.href;
+    return u.includes('/assignments/') ||
+           (u.includes('/projects/') && (u.includes('/tasks/') || u.includes('/tasks?')));
   }
   function isMTurkDomain(){
     return /(^|\.)mturk\.com$/i.test(location.hostname);
@@ -204,6 +250,7 @@
     if(!isMTurkDomain()) return;
     if(window.self!==window.top) return;
     if(isMTurkQueueTab()) return;
+    if(isMTurkHITTab()) return;                   // HIT tabs manage their own lifecycle — bug #1 fix
     _autoCloseArmed=true;
     console.log('[HBSN] 20s general auto-close armed for',location.href);
     setTimeout(()=>{
@@ -212,9 +259,8 @@
         return;
       }
       console.warn('[HBSN] ⏰ 20s auto-close — closing non-/tasks MTurk tab');
-      try{markSubmitted();}catch(e){}
-      try{clearTaskHeartbeat();}catch(e){}
-      try{releaseLock();}catch(e){}
+      // Don't touch markSubmitted or releaseLock — this branch is only for non-HIT tabs (dashboard etc.)
+      // Those globals belong to the HIT lifecycle and must not be mutated from unrelated MTurk pages.
       try{window.close();}catch(e){}
       setTimeout(()=>{try{window.open('','_self');window.close();}catch(e){}},150);
     },20000);
@@ -458,19 +504,35 @@
   /* ═══════════════════════════════════════
      GATE
   ═══════════════════════════════════════ */
-  function gate(onPass,onFail){
+  // gate() bug #3 fix — cached workers used to wait for a full Google-Sheets round-trip
+  // on EVERY HIT open. With the aggressive auto-close, a 2-5s fetch was eating the HIT's
+  // whole processing budget. Now:
+  //   • cached + recently verified → pass immediately, no network call
+  //   • cached + stale → pass immediately AND kick off a background verify
+  //   • no cache → old detect+check path (blocking is fine, it's a first-time cost)
+  let _bgReVerifyStarted = false;
+  function gate(onPass, onFail) {
     injectAuthCSS();
-    const savedId=LIC.savedWorkerId();
-    if(savedId&&LIC.isLocalValid()){
-      showCheckingBadge(savedId);
-      checkSheet(savedId,(ok,reason)=>{
-        removeBadge();
-        if(ok){onPass();startBgReVerify(savedId);}
-        else if(reason==='network_error'){onPass();startBgReVerify(savedId);}
-        else{LIC.clear();showBlockScreen(savedId,'Your Worker ID has been removed.');onFail();}
-      });
+    const savedId = LIC.savedWorkerId();
+    if (savedId && LIC.isLocalValid()) {
+      const fresh = (Date.now() - LIC.lastVerifiedAt()) < LIC_REVERIFY_MS;
+      if (fresh) {
+        // Trust the recent verification, don't block.
+        onPass();
+      } else {
+        // Pass through immediately, verify in the background — if it fails, we still
+        // block future HITs via showBlockScreen + release the current lock so the queue
+        // doesn't proceed to yet another HIT.
+        onPass();
+        checkSheet(savedId, (ok, reason) => {
+          if (ok) { LIC.markVerified(); }
+          else if (reason === 'network_error') { /* keep trust, retry via startBgReVerify */ }
+          else { LIC.clear(); showBlockScreen(savedId, 'Your Worker ID has been removed.'); releaseLock(); }
+        });
+      }
+      if (!_bgReVerifyStarted) { _bgReVerifyStarted = true; startBgReVerify(savedId); }
     } else {
-      LIC.clear();showBadge(getWorkerID());_detectAttempts=0;doFullDetect(onPass,onFail);
+      LIC.clear(); showBadge(getWorkerID()); _detectAttempts = 0; doFullDetect(onPass, onFail);
     }
   }
 
@@ -494,11 +556,12 @@
     });
   }
 
-  let _bgFails=0;
+  let _bgFails=0, _bgReVerifyInterval=null;
   function startBgReVerify(wid){
-    setInterval(()=>{
+    if(_bgReVerifyInterval) return;                              // bug #15 fix — don't stack intervals across HIT tabs
+    _bgReVerifyInterval = setInterval(()=>{
       checkSheet(wid,(ok,reason)=>{
-        if(ok){_bgFails=0;return;}
+        if(ok){_bgFails=0; LIC.markVerified(); return;}
         if(reason==='network_error'){_bgFails++;if(_bgFails>=2){_bgFails=0;}return;}
         _bgFails=0;LIC.clear();releaseLock();showRevokedScreen();
       });
@@ -667,6 +730,14 @@
             }
         });
     }
+
+    // Bug #11 fix — the stale-lock reaper wasn't on a timer; a truly stuck lock would
+    // hang the queue forever until the user reloaded manually. Poll every 5s.
+    setInterval(() => {
+      const wasLocked = isLocked();
+      checkStaleLock();
+      if (wasLocked && !isLocked() && !isPaused()) processNextHIT();
+    }, 5000);
 
     processNextHIT();
   }
@@ -838,14 +909,23 @@
      ★ SUBMIT ENGINE
   ═══════════════════════════════════════ */
   function submitLoop(n){
+    const inFrameCtx = window.self !== window.top;
     if(n > MAX_SUBMIT_TRIES){
       taskStatus('⚠️ All submit methods exhausted — trying external submit…');
       if(externalSubmit()){
         taskStatus('🚀 External submit fired! Waiting for redirect...');
+        if(!inFrameCtx && typeof window.__hbsn_submitted === 'function') window.__hbsn_submitted();
       } else {
-        taskStatus('❌ Could not submit — releasing lock');
-        clearTaskHeartbeat();
-        releaseLock();
+        // Bug #2 fix — iframes must NOT release shared lock/heartbeat; only the top-level
+        // task tab owns those. Iframes just report failure via postMessage.
+        if(inFrameCtx){
+          taskStatus('❌ iframe submit failed — signalling parent');
+          try{ window.top.postMessage({type:'HBSN_SUBMIT_FAILED'},'*'); }catch(e){}
+        } else {
+          taskStatus('❌ Could not submit — releasing lock');
+          clearTaskHeartbeat();
+          releaseLock();
+        }
       }
       return;
     }
@@ -869,6 +949,8 @@
     if (clicked) {
       console.log('[HBSN] 🚀 Submit button clicked natively.');
       markSubmitted();
+      // Tell runParent's beforeunload that this HIT truly submitted (bug #2 fix).
+      if(!inFrameCtx && typeof window.__hbsn_submitted === 'function') window.__hbsn_submitted();
       taskStatus('🚀 Submit clicked! Waiting for page to redirect...');
       showFlash('🚀','#22c55e');
 
@@ -989,15 +1071,40 @@
   ═══════════════════════════════════════ */
   function runParent(){
     let done=false;
+    let submitted=false;                   // bug #2 fix — separate from `done` (which flips as soon as an answer is chosen)
+    window.__hbsn_submitted = () => { submitted = true; };
     const ver=getVer();
 
     addTaskUI('…','🔍 Scanning…');
     taskStatus('⏳ Waiting for page to load…');
     GM_setValue('hbsn_time',Date.now());
 
+    // Bug #14 — captcha detection must be running even during the (now non-blocking) gate check.
     CAPTCHA_SYSTEM.init();
 
-    window.addEventListener('beforeunload',()=>{ if(!done){ clearTaskHeartbeat(); releaseLock(); } });
+    // Bug #1 safety net — HIT tabs no longer have the 20s general auto-close, so if the whole
+    // flow somehow never completes (submit exhausted, page frozen), force-close after 90s.
+    // Skipped while a real CAPTCHA is being solved so the user isn't cut off.
+    const _safety = setTimeout(() => {
+      if (submitted) return;                         // normal flow already handled it
+      if (CAPTCHA_SYSTEM.active) return;             // user is solving — give more time
+      console.warn('[HBSN] HIT safety timer ('+HIT_SAFETY_CLOSE_MS+'ms) — force closing');
+      taskStatus('⏰ Safety timer — force closing…');
+      markSubmitted();
+      clearTaskHeartbeat();
+      releaseLock();
+      forceCloseTab();
+    }, HIT_SAFETY_CLOSE_MS);
+    window.addEventListener('beforeunload', () => { try { clearTimeout(_safety); } catch(e) {} });
+
+    // Beforeunload should ONLY release the lock if submission truly never started (bug #2 fix).
+    // Between "answer chosen" (done=true) and "submit clicked" (submitted=true), releasing the lock
+    // makes the queue grab another HIT while this one is still in flight.
+    window.addEventListener('beforeunload', () => {
+      if (submitted) return;                         // real submit happened — cleanup path handles it
+      // Still not submitted → free the lock so queue can move on, but only if we truly own it.
+      if (_iOwnTaskSingleton()) { clearTaskHeartbeat(); releaseLock(); }
+    });
 
     /* Cross-Origin Iframe Detection */
     window.addEventListener('message',e=>{
@@ -1011,6 +1118,7 @@
 
             setTimeout(()=>{
                 markSubmitted();
+                submitted = true;                      // bug #2 — return path is a valid completion
                 clearTaskHeartbeat();
                 releaseLock();
                 try {
@@ -1074,6 +1182,7 @@
 
          setTimeout(()=>{
            markSubmitted();
+           submitted = true;                          // bug #2 — 26-list return path is a valid completion
            clearTaskHeartbeat();
            releaseLock();
            try {
@@ -1112,6 +1221,7 @@
 
           setTimeout(()=>{
             markSubmitted();
+            submitted = true;                         // bug #2 — V2-match return path is a valid completion
             clearTaskHeartbeat();
             releaseLock();
             try {
