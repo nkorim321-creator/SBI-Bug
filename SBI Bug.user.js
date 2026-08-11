@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HasanBhaierSalamNin36.0
 // @namespace    https://worker.mturk.com/
-// @version      34.2
+// @version      34.3
 // @description  v34.2 — fix: same-project HITs (2 assignments of one batch shown as duplicate rows in queue) now open in PARALLEL instead of the 2nd being dropped as a dup. Concurrency counted by per-HIT-tab heartbeats (unique per tab, refreshed every 3s) so two same-URL HITs are correctly counted as two. Everything else from v34.1: parallel queue, background tabs, safety net, non-blocking gate, sheet allowlist.
 // @author       Custom Script
 // @match        https://worker.mturk.com/*
@@ -819,7 +819,7 @@
   // the same href are OPENED IN PARALLEL — MTurk hands each new tab its own
   // assignment. A stale open cooldown (OPEN_COOLDOWN_MS) throttles bursts so newly
   // opened HIT tabs have time to start beating before the next open decision.
-  let _lastOpen = 0;
+  var _lastOpen = 0;              // var so it's hoisted; processQueue may be called from the routing/gate path before this line executes
   function processQueue() {
     if (isPaused()) return;
 
