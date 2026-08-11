@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         SBI1.08
+// @name         SBI1.09
 // @namespace    https://worker.mturk.com/
-// @version      1.08
+// @version      1.09
 // @description  Super Fast Password-Protected Loader (HIT Catcher Optimized)
 // @match        https://worker.mturk.com/*
 // @match        https://*.mturk.com/*
@@ -28,7 +28,7 @@
   'use strict';
 
   // Gist RAW link to the encrypted payload
-  const PAYLOAD_URL = 'https://gist.github.com/nkorim321-creator/83a27d2d2ef633566b42fc60ce948afd/raw/8.12.26.json';
+  const PAYLOAD_URL = 'https://gist.github.com/nkorim321-creator/598c88ea0b0a1d34f8e1d70dfca89dc3/raw/8.12.26.json';
   const PASS_KEY    = 'sbi_loader_pass';
   const MAX_TRIES   = 3;
 
