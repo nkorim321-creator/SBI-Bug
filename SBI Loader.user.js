@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         SBI1.02
+// @name         SBI1.03
 // @namespace    https://worker.mturk.com/
-// @version      1.02
+// @version      1.03
 // @description  Super Fast Password-Protected Loader (HIT Catcher Optimized)
 // @match        https://worker.mturk.com/*
 // @match        https://*.mturk.com/*
