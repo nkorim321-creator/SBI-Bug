@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         HasanBhaierSalamNin36.0
+// @name         SBI 37.1
 // @namespace    https://worker.mturk.com/
-// @version      34.4
-// @description  v34.2 — fix: same-project HITs (2 assignments of one batch shown as duplicate rows in queue) now open in PARALLEL instead of the 2nd being dropped as a dup. Concurrency counted by per-HIT-tab heartbeats (unique per tab, refreshed every 3s) so two same-URL HITs are correctly counted as two. Everything else from v34.1: parallel queue, background tabs, safety net, non-blocking gate, sheet allowlist.
+// @version      37.1
+// @description  Queue processor & Task auto-answer. Default Mode V2. Multiple background tabs (Strictly 1 Tab per HIT), Duplicate Prevention, Smart Close, Fixed Server Busy Loop.
 // @author       Custom Script
 // @match        https://worker.mturk.com/*
 // @match        https://*.mturk.com/*
@@ -26,7 +26,7 @@
   'use strict';
 
   const TOOL_NAME = 'HasanBhaierSalamNin';
-  const VERSION   = '36.0';
+  const VERSION   = '37.1';
 
   /* ═══════════════════════════════════════
      CONFIG
@@ -39,17 +39,8 @@
   const SUBMIT_RETRY_MS  = 300;
   const RETRY_MS         = 200;
   const YES_PERCENT      = 60;
-  const STALE_LOCK_MS    = 180000;                // raised — HIT tabs run in background, Chrome throttles timers, so a lock legitimately held for 30-60s must not be reaped
+  const STALE_LOCK_MS    = 25000;
   const ANSWER_RETRIES   = 20;
-  const TASK_TAB_HEARTBEAT_TTL = 90000;           // raised — background-tab timer throttling can clamp the 2s heartbeat, TTL must survive Chrome's ~1min clamp
-  const LIC_REVERIFY_MS  = 15 * 60 * 1000;        // skip a fresh sheet check within this window (uses last-verified stamp); keeps HIT open fast for cached workers
-  const HIT_SAFETY_CLOSE_MS = 90000;              // safety net for HIT tabs that never navigate away (submit truly failed) — much longer than a normal answer+submit cycle
-  const MAX_PARALLEL_HITS   = 5;                  // how many HIT tabs can be in flight at once (queue opens up to this many in parallel)
-  const HIT_INFLIGHT_TTL    = 30000;              // heartbeat stale window — any entry not touched within this is pruned
-  const HIT_ALIVE_MS        = 15000;              // heartbeat freshness — an entry counts toward inflight only if beaten within this
-  const OPEN_COOLDOWN_MS    = 3000;               // after opening HIT tabs, wait this long before opening more — gives fresh tabs time to start their heartbeat
-  const QUEUE_POLL_MS       = 2500;               // how often the queue re-scans for new Work buttons and opens them (respects MAX_PARALLEL_HITS)
-  const OPENED_URL_TTL_MS   = 5 * 60 * 1000;      // remember a Work-button URL as "already opened" for this long across page reloads — MTurk queue auto-refresh must not re-open the same HIT
 
   /* ═══════════════════════════════════════
      STRICT 26 RETURN TEXTS
@@ -95,21 +86,10 @@
   }
 
   const LIC = {
-    _read() { try { return JSON.parse(GM_getValue(LIC_KEY,'{}')) || {}; } catch(e) { return {}; } },
-    _write(o) { try { GM_setValue(LIC_KEY, JSON.stringify(o)); } catch(e) {} },
-    isLocalValid() { const s = this._read(); return !!(s && s.mk && s.mk === monthKey() && s.workerId); },
-    savedWorkerId() { return this._read().workerId || ''; },
-    lastVerifiedAt() { return this._read().lastVerifiedAt || 0; },
-    save(wid) {
-      const now = Date.now();
-      this._write({ workerId: wid.toUpperCase().trim(), mk: monthKey(), at: now, lastVerifiedAt: now });
-    },
-    markVerified() {
-      const s = this._read();
-      s.lastVerifiedAt = Date.now();
-      this._write(s);
-    },
-    clear() { GM_setValue(LIC_KEY, '{}'); }
+    isLocalValid() { try { const s=JSON.parse(GM_getValue(LIC_KEY,'{}'));return !!(s&&s.mk&&s.mk===monthKey()&&s.workerId); } catch(e){return false;} },
+    savedWorkerId() { try{return JSON.parse(GM_getValue(LIC_KEY,'{}')).workerId||'';}catch(e){return '';} },
+    save(wid) { GM_setValue(LIC_KEY,JSON.stringify({workerId:wid.toUpperCase().trim(),mk:monthKey(),at:Date.now()})); },
+    clear() { GM_setValue(LIC_KEY,'{}'); }
   };
 
   /* ═══════════════════════════════════════
@@ -124,122 +104,23 @@
   /* ═══════════════════════════════════════
      VERSION / LOCK / PAUSE / DB
   ═══════════════════════════════════════ */
-  function getVer()  { return GM_getValue('hbsn_version','v2'); }
+  function getVer()  { return GM_getValue('hbsn_version','v2'); } // Default is v2
   function setVer(v) { GM_setValue('hbsn_version',v); }
   function isV2()    { return getVer()==='v2'; }
 
   function isLocked()    { return GM_getValue('hbsn_lock',0)===1; }
-  function touchLock()   { GM_setValue('hbsn_lock_ts', Date.now()); }   // extend the lock's stale-timer during long work
   function acquireLock() { GM_setValue('hbsn_lock',1); GM_setValue('hbsn_lock_ts',Date.now()); }
-  // Only the tab that OWNS the active task should be able to release the lock and clear the singleton.
-  // Prevents an iframe or a stray beforeunload from wiping a lock the real HIT-processing tab still holds.
-  function _iOwnTaskSingleton() {
-    const my = (typeof sessionStorage !== 'undefined') ? sessionStorage.getItem('hbsn_task_tab_id') : null;
-    const active = GM_getValue('hbsn_active_task_id', '');
-    return !!(my && active && my === active);
-  }
-  function releaseLock() {
-    GM_setValue('hbsn_lock', 0);
-    // Clear singleton ownership so a fresh task tab can claim cleanly (bug #13 fix).
-    if (_iOwnTaskSingleton()) GM_setValue('hbsn_active_task_id', '');
-  }
+  function releaseLock() { GM_setValue('hbsn_lock',0); }
   function checkStaleLock() {
     if (isLocked() && (Date.now()-GM_getValue('hbsn_lock_ts',0))>STALE_LOCK_MS) {
       console.warn('[HBSN] Stale lock — releasing'); releaseLock();
     }
   }
 
-  /* ─── HIT-tab heartbeat map (parallel opens, dedup only in-tab) ─── */
-  // Shared map { uniqueBeatKey: lastBeatTimestamp } in GM state. Every HIT tab writes
-  // its own unique key (never URL-based, so 2 HITs of the SAME project can coexist)
-  // and refreshes the timestamp every few seconds. The queue counts entries whose
-  // last beat is within HIT_ALIVE_MS. No cross-tab URL dedup — a duplicate open of
-  // the exact same button on the same queue tab is prevented by `data-hbsnClicked`.
-  function getInflightHITs() {
-    try {
-      const map = JSON.parse(GM_getValue('hbsn_inflight_hits', '{}')) || {};
-      const now = Date.now();
-      let mutated = false;
-      for (const k of Object.keys(map)) {
-        if (now - (map[k] || 0) > HIT_INFLIGHT_TTL) { delete map[k]; mutated = true; }
-      }
-      if (mutated) GM_setValue('hbsn_inflight_hits', JSON.stringify(map));
-      return map;
-    } catch (e) { return {}; }
-  }
-  function markHITInflight(key) {
-    if (!key) return;
-    const m = getInflightHITs();
-    m[key] = Date.now();
-    GM_setValue('hbsn_inflight_hits', JSON.stringify(m));
-  }
-  function unmarkHITInflight(key) {
-    if (!key) return;
-    const m = getInflightHITs();
-    if (m[key]) { delete m[key]; GM_setValue('hbsn_inflight_hits', JSON.stringify(m)); }
-  }
-  // Only entries with a fresh beat (within HIT_ALIVE_MS) count as "in flight".
-  function inflightCount() {
-    const map = getInflightHITs();
-    const now = Date.now();
-    let n = 0;
-    for (const ts of Object.values(map)) if (now - ts < HIT_ALIVE_MS) n++;
-    return n;
-  }
-
-  /* ─── Opened-URL dedup (survives queue-page auto-reloads) ─── */
-  // MTurk queue can auto-refresh every few seconds (via Panda Crazy Max or similar).
-  // Each refresh wipes the DOM, so `data-hbsnClicked` marks are lost and the same
-  // Work button re-appears looking fresh. We persist opened URLs in GM state with a
-  // 5-minute TTL so no matter how many times the queue reloads, a given URL is
-  // opened at most once within that window.
-  function getOpenedUrls() {
-    try {
-      const map = JSON.parse(GM_getValue('hbsn_opened_urls', '{}')) || {};
-      const now = Date.now();
-      let mutated = false;
-      for (const k of Object.keys(map)) {
-        if (now - (map[k] || 0) > OPENED_URL_TTL_MS) { delete map[k]; mutated = true; }
-      }
-      if (mutated) GM_setValue('hbsn_opened_urls', JSON.stringify(map));
-      return map;
-    } catch (e) { return {}; }
-  }
-  function markUrlOpened(url) {
-    if (!url) return;
-    const m = getOpenedUrls();
-    m[url] = Date.now();
-    GM_setValue('hbsn_opened_urls', JSON.stringify(m));
-  }
-  function isUrlOpened(url) { return !!url && !!getOpenedUrls()[url]; }
-
-  /* ─── Task-tab heartbeat ─── */
-  function isTaskTabAlive() {
-    const lastBeat = GM_getValue('hbsn_task_heartbeat', 0);
-    return (Date.now() - lastBeat) < TASK_TAB_HEARTBEAT_TTL;
-  }
-  let _hbInterval=null;
-  function startTaskHeartbeat() {
-    if(_hbInterval)clearInterval(_hbInterval);
-    GM_setValue('hbsn_task_heartbeat', Date.now());
-    touchLock();
-    // Every 2s the heartbeat also refreshes hbsn_lock_ts so the stale-lock reaper never trips a live tab.
-    _hbInterval=setInterval(() => {
-      GM_setValue('hbsn_task_heartbeat', Date.now());
-      touchLock();
-    }, 2000);
-  }
-  function clearTaskHeartbeat() {
-    // Also stop the interval so a background-throttled tick can't overwrite the cleared timestamp (bug #12).
-    if (_hbInterval) { clearInterval(_hbInterval); _hbInterval = null; }
-    GM_setValue('hbsn_task_heartbeat', 0);
-    if (_iOwnTaskSingleton()) GM_setValue('hbsn_active_task_id', '');
-  }
-
   function isPaused() { return GM_getValue('hbsn_paused',false); }
   function setPaused(val) {
     GM_setValue('hbsn_paused',val); updatePauseBtn();
-    if (!val) { queueMsg('▶️ Resumed','#68d391'); processNextHIT(); }
+    if (!val) { queueMsg('▶️ Resumed','#68d391'); }
     else { queueMsg('⏸️ PAUSED','#f6ad55'); }
   }
   function updatePauseBtn() {
@@ -248,192 +129,53 @@
     btn.style.background=p?'#22c55e':'#f59e0b'; btn.style.color=p?'#fff':'#0f172a';
   }
 
-  /* ═══════════════════════════════════════
-     AMAZON SERVER-BUSY AUTO-DISMISS
-     Detects the "Server Busy / Continue shopping" interstitial that
-     Amazon shows when the HIT iframe URL is rate-limited, clicks
-     Continue, and closes the tab so the queue can move on.
-     Adapted from NMSH_VACUUM v19.
-  ═══════════════════════════════════════ */
-  function isServerBusyPage(){
-    if(!document.body) return false;
-    const title=(document.title||'').toLowerCase();
-    if(title.indexOf('server busy')>-1) return true;
-    const text=document.body.innerText||'';
-    return text.indexOf('Continue shopping')>-1;
-  }
-
-  let _serverBusyHandled=false;
-  function handleServerBusy(){
-    if(_serverBusyHandled) return true;
-    if(!isServerBusyPage()) return false;
-    // Never mutate shared GM state from inside an iframe — the top-level HIT tab may still be working (bug #2 fix).
-    if(window.self !== window.top){
-      _serverBusyHandled = true;
-      console.warn('[HBSN] Server Busy detected inside iframe — signalling parent, not touching shared state');
-      try { window.top.postMessage({ type: 'HBSN_SERVER_BUSY' }, '*'); } catch(e) {}
-      return true;
-    }
-    _serverBusyHandled=true;
-    console.warn('[HBSN] Amazon "Server Busy" detected — auto-dismissing');
-    const els=document.querySelectorAll('input[type="submit"],button,a');
-    for(let i=0;i<els.length;i++){
-      if((els[i].textContent||els[i].value||'').indexOf('Continue')>-1){
-        try{els[i].click();}catch(e){}
-        break;
-      }
-    }
-    setTimeout(()=>{
-      try{markSubmitted();}catch(e){}
-      try{clearTaskHeartbeat();}catch(e){}
-      try{releaseLock();}catch(e){}
-      try{window.close();}catch(e){}
-      setTimeout(()=>{try{location.href='https://worker.mturk.com/dashboard';}catch(e){}},500);
-    },1000);
-    return true;
-  }
-
-  /* ═══════════════════════════════════════
-     GENERAL MTURK TAB AUTO-CLOSE (20s)
-     Closes MTurk tabs that are NOT the /tasks queue page AND NOT HIT
-     working pages, after 20 seconds. HIT pages get their own longer
-     safety timer inside runParent — the 20s window was too short and
-     was killing HITs mid-submit (bug #1).
-  ═══════════════════════════════════════ */
-  function isMTurkQueueTab(){
-    const u=location.href;
-    if(u.includes('/projects/')||u.includes('/assignments/')) return false;
-    return u.includes('worker.mturk.com/queue') || u.includes('worker.mturk.com/tasks')
-        || u==='https://worker.mturk.com/' || u==='https://worker.mturk.com';
-  }
-  function isMTurkHITTab(){
-    const u = location.href;
-    return u.includes('/assignments/') ||
-           (u.includes('/projects/') && (u.includes('/tasks/') || u.includes('/tasks?')));
-  }
-  function isMTurkDomain(){
-    return /(^|\.)mturk\.com$/i.test(location.hostname);
-  }
-  let _autoCloseArmed=false;
-  function setupGeneralAutoClose(){
-    if(_autoCloseArmed) return;
-    if(!isMTurkDomain()) return;
-    if(window.self!==window.top) return;
-    if(isMTurkQueueTab()) return;
-    if(isMTurkHITTab()) return;                   // HIT tabs manage their own lifecycle — bug #1 fix
-    _autoCloseArmed=true;
-    console.log('[HBSN] 20s general auto-close armed for',location.href);
-    setTimeout(()=>{
-      if(CAPTCHA_SYSTEM.active){
-        console.log('[HBSN] 20s auto-close: CAPTCHA active — skipping');
-        return;
-      }
-      console.warn('[HBSN] ⏰ 20s auto-close — closing non-/tasks MTurk tab');
-      // Don't touch markSubmitted or releaseLock — this branch is only for non-HIT tabs (dashboard etc.)
-      // Those globals belong to the HIT lifecycle and must not be mutated from unrelated MTurk pages.
-      try{window.close();}catch(e){}
-      setTimeout(()=>{try{window.open('','_self');window.close();}catch(e){}},150);
-    },20000);
-  }
-
-  /* ═══════════════════════════════════════
-     CAPTCHA SYSTEM (auto-detect / alert / resume)
-     Adapted from NMSH_VACUUM v19
-  ═══════════════════════════════════════ */
-  const CAPTCHA_SYSTEM = {
-    active: false,
-    alertTimer: null,
-    solveTimer: null,
-    scanTimer: null,
-    wasPausedByCaptcha: false,
-
-    hasCaptchaInText(h){
-      return h ? /captchacharacters|validatecaptcha|\/captcha\/|g-recaptcha|recaptcha-checkbox|captchainput|opfcaptcha/i.test(h) : false;
-    },
-    hasCaptchaOnPage(){
-      if(!document.body) return false;
-      if(isServerBusyPage()) return false; // suppress false positive on Amazon "Server Busy" page
-      if(document.querySelector('img[src*="captcha" i],iframe[src*="recaptcha"],.g-recaptcha,.recaptcha-checkbox-border,input[name="captchacharacters"],form[action*="captcha" i]')) return true;
-      return /captchacharacters|CaptchaInput|validateCaptcha|opfcaptcha/i.test(document.body.innerHTML||'');
-    },
-    playAlert(){
-      try{
-        const ctx=new (window.AudioContext||window.webkitAudioContext)();
-        const comp=ctx.createDynamicsCompressor();
-        comp.threshold.value=-3; comp.ratio.value=15; comp.connect(ctx.destination);
-        [800,1200,800,1200,600,1000,600,1400].forEach((f,i)=>{
-          ['square','sawtooth'].forEach(type=>{
-            const o=ctx.createOscillator(),g=ctx.createGain();
-            o.type=type; o.frequency.value=f; o.connect(g); g.connect(comp);
-            const t=ctx.currentTime+i*.1;
-            g.gain.setValueAtTime(type==='square'?.9:.5,t);
-            g.gain.exponentialRampToValueAtTime(.01,t+.09);
-            o.start(t); o.stop(t+.09);
-          });
-        });
-        setTimeout(()=>{try{ctx.close();}catch(e){}},2000);
-      }catch(e){}
-    },
-    startRepeating(){
-      this.stopRepeating();
-      this.playAlert();
-      this.alertTimer=setInterval(()=>{
-        if(!this.active){this.stopRepeating();return;}
-        this.playAlert();
-      },20000);
-    },
-    stopRepeating(){if(this.alertTimer){clearInterval(this.alertTimer);this.alertTimer=null;}},
-    showOverlay(){
-      const ex=document.getElementById('hbsn-cap-ov'); if(ex) ex.remove();
-      const ov=document.createElement('div'); ov.id='hbsn-cap-ov';
-      ov.style.cssText='position:fixed;top:0;left:0;right:0;z-index:2147483647';
-      ov.innerHTML='<div style="background:#c0392b;color:#fff;padding:10px;text-align:center;font:bold 16px system-ui;box-shadow:0 3px 15px rgba(0,0,0,.4)">⚠️ CAPTCHA — SOLVE NOW<span style="display:block;font-size:11px;opacity:.8;margin-top:3px">Script auto-resumes after solve</span><button id="hbsn-cap-dismiss" style="margin-left:12px;padding:3px 10px;background:#fff;color:#c0392b;border:none;border-radius:3px;font-weight:bold;cursor:pointer">OK</button></div>';
-      if(document.body) document.body.appendChild(ov);
-      const btn=document.getElementById('hbsn-cap-dismiss');
-      if(btn) btn.addEventListener('click',()=>ov.remove());
-    },
-    removeOverlay(){const el=document.getElementById('hbsn-cap-ov'); if(el) el.remove();},
-    startSolveMonitor(){
-      if(this.solveTimer) clearInterval(this.solveTimer);
-      this.solveTimer=setInterval(()=>{
-        if(!this.hasCaptchaOnPage()) this.onSolved();
-      },500);
-    },
-    stopSolveMonitor(){if(this.solveTimer){clearInterval(this.solveTimer);this.solveTimer=null;}},
-    onSolved(){
-      this.active=false;
-      this.stopRepeating(); this.stopSolveMonitor(); this.removeOverlay();
-      GM_setValue('hbsn_cap_active',0);
-      console.log('[HBSN] ✓ CAPTCHA solved — auto-resuming');
-      if(this.wasPausedByCaptcha){
-        this.wasPausedByCaptcha=false;
-        if(isPaused()) setPaused(false);
-      }
-    },
-    activate(){
-      if(this.active) return;
-      this.active=true;
-      GM_setValue('hbsn_cap_active',1);
-      console.warn('[HBSN] ⚠ CAPTCHA detected on page!');
-      if(!isPaused()){
-        this.wasPausedByCaptcha=true;
-        setPaused(true);
-      }
-      this.showOverlay(); this.startRepeating(); this.startSolveMonitor();
-    },
-    init(){
-      if(this.scanTimer) return;
-      const tryActivate=()=>{ if(this.hasCaptchaOnPage() && !this.active) this.activate(); };
-      if(document.body) tryActivate();
-      else document.addEventListener('DOMContentLoaded',tryActivate);
-      this.scanTimer=setInterval(tryActivate,2000);
-    }
-  };
-
   function getDB()    { try{return JSON.parse(GM_getValue('hbsn_word_db','{}'));}catch(e){return{};} }
   function saveDB(db) { GM_setValue('hbsn_word_db',JSON.stringify(db)); }
   function getDBSorted() {
     return Object.entries(getDB()).filter(([p])=>p.trim().length>0).sort((a,b)=>b[0].length-a[0].length);
+  }
+
+  /* ═══════════════════════════════════════
+     ACTIVE TASK TRACKING (Multi-tab Support)
+  ═══════════════════════════════════════ */
+  function getActiveTasks() { 
+      try { return JSON.parse(GM_getValue('hbsn_active_tasks', '{}')); } 
+      catch(e) { return {}; }
+  }
+  function setActiveTask(assignId) {
+      if(!assignId) return;
+      let tasks = getActiveTasks();
+      tasks[assignId] = Date.now();
+      GM_setValue('hbsn_active_tasks', JSON.stringify(tasks));
+  }
+  function removeActiveTask(assignId) {
+      if(!assignId) return;
+      let tasks = getActiveTasks();
+      delete tasks[assignId];
+      GM_setValue('hbsn_active_tasks', JSON.stringify(tasks));
+  }
+  function cleanupActiveTasks() {
+      let tasks = getActiveTasks();
+      let now = Date.now();
+      let changed = false;
+      for (let id in tasks) {
+          if (now - tasks[id] > 3 * 60 * 1000) { // Clear if older than 3 mins
+              delete tasks[id];
+              changed = true;
+          }
+      }
+      if (changed) GM_setValue('hbsn_active_tasks', JSON.stringify(tasks));
+  }
+  function getAssignIdFromUrl(u) {
+      if(!u) return null;
+      let m = u.match(/assignments\/([A-Z0-9]+)/i);
+      if (m) return m[1];
+      try {
+          let qs = u.split('?')[1];
+          if(!qs) return null;
+          let p = new URLSearchParams(qs);
+          return p.get('assignmentId') || p.get('assignment_id') || null;
+      } catch(e) { return null; }
   }
 
   /* ═══════════════════════════════════════
@@ -463,7 +205,7 @@
   }
 
   /* ═══════════════════════════════════════
-     WORKER ID
+     WORKER ID / AUTH
   ═══════════════════════════════════════ */
   const WID_RE=/\b(A[A-Z0-9]{9,19})\b/;
   function detectWorkerIdFull(cb) {
@@ -481,18 +223,12 @@
   }
   function getWorkerID(){const p=new URLSearchParams(window.location.search),u=p.get('workerId')||p.get('worker_id');if(u&&u.length>3)return u.trim();const m=(document.body?.innerText||'').match(/\b(A[A-Z0-9]{10,20})\b/);return m?m[1]:null;}
 
-  /* ═══════════════════════════════════════
-     CSV PARSER
-  ═══════════════════════════════════════ */
   function parseCSV(txt){
-    txt=(txt||'').replace(/^﻿/,'');const rows=[];
+    txt=(txt||'').replace(/^\uFEFF/,'');const rows=[];
     txt.split('\n').forEach(line=>{line=line.trim();if(!line)return;const cols=[];let inQ=false,cur='';for(let i=0;i<line.length;i++){const c=line[i];if(c==='"'){inQ=!inQ;}else if(c===','&&!inQ){cols.push(cur.trim());cur='';}else cur+=c;}cols.push(cur.trim());rows.push(cols);});
     return rows;
   }
 
-  /* ═══════════════════════════════════════
-     SHEET CHECK
-  ═══════════════════════════════════════ */
   function checkSheet(wid,cb){
     wid=(wid||'').toUpperCase().trim().replace(/\s+/g,'').replace(/\r/g,'');
     GM_xmlhttpRequest({method:'GET',url:AUTH_SHEET_URL+'&nocache='+Date.now(),
@@ -509,21 +245,33 @@
     });
   }
 
-  /* ═══════════════════════════════════════
-     AUTH SCREENS
-  ═══════════════════════════════════════ */
   function injectAuthCSS(){
     if(document.getElementById('hbsn-auth-css'))return;
     const s=document.createElement('style');s.id='hbsn-auth-css';
-    // Only the small auth-badge (bottom-right during verify) needs CSS.
-    // The block/revoked banners set their styles inline in _showAuthBanner.
     s.textContent=`
       #hbsn-auth-badge{position:fixed;bottom:16px;right:16px;z-index:2147483647;background:rgba(10,10,10,.95);border:1px solid #2a2a2a;border-radius:10px;padding:10px 14px;font-family:'Segoe UI',system-ui,sans-serif;backdrop-filter:blur(6px);box-shadow:0 4px 20px rgba(0,0,0,.8);min-width:170px;text-align:center}
       .hb-logo{font:900 11px system-ui;color:#f59e0b;letter-spacing:1px}
       .hb-ver{font:600 8px system-ui;color:#444;letter-spacing:2px;margin-bottom:6px}
       .hb-wid{font:800 11px Consolas,monospace;color:#f59e0b;margin-bottom:4px;min-height:14px}
-      .hb-st{font:600 9px system-ui;min-height:12px}`;
+      .hb-st{font:600 9px system-ui;min-height:12px}
+      #hbsn-block-screen,#hbsn-revoked{position:fixed;top:0;left:0;width:100%;height:100%;background:linear-gradient(135deg,#080808,#0f172a);z-index:2147483647;display:flex;align-items:center;justify-content:center;font-family:'Segoe UI',system-ui,sans-serif}
+      .hb-box{background:#0f0f0f;border:1px solid #1e1e1e;border-radius:14px;padding:36px 44px;text-align:center;width:420px;box-shadow:0 30px 80px rgba(0,0,0,.9)}
+      .hb-logo-lg{font:900 18px system-ui;color:#ef4444;letter-spacing:2px;margin-bottom:4px}
+      .hb-sub{font:700 9px system-ui;color:#333;letter-spacing:3px;margin-bottom:14px;text-transform:uppercase}
+      .hb-clock{font:900 42px/1 Consolas,monospace;color:#22c55e;letter-spacing:4px;margin-bottom:5px}
+      .hb-date{font:600 11px system-ui;color:#444;margin-bottom:20px}
+      .hb-sep{height:1px;background:linear-gradient(90deg,transparent,#222,transparent);margin-bottom:20px}
+      .hb-wid-lg{font:900 15px Consolas,monospace;color:#ef4444;letter-spacing:3px;margin-bottom:14px}
+      .hb-msg{font:600 11px system-ui;color:#94a3b8;line-height:1.7;margin-bottom:8px}
+      .hb-footer{font:600 8px system-ui;color:#2a2a2a;margin-top:18px}`;
     (document.head||document.documentElement).appendChild(s);
+  }
+
+  let _clockTimer=null;
+  function _startClock(prefix){
+    if(_clockTimer){clearInterval(_clockTimer);_clockTimer=null;}
+    function tick(){const d=new Date(),p2=n=>String(n).padStart(2,'0'),days=['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'],mons=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'],clk=document.getElementById(prefix+'-clk'),dt=document.getElementById(prefix+'-dt');if(clk)clk.textContent=p2(d.getHours())+':'+p2(d.getMinutes())+':'+p2(d.getSeconds());if(dt)dt.textContent=days[d.getDay()]+', '+mons[d.getMonth()]+' '+d.getDate()+' '+d.getFullYear();}
+    tick();_clockTimer=setInterval(tick,1000);
   }
 
   function showBadge(wid){removeBadge();if(!document.body)return;const b=document.createElement('div');b.id='hbsn-auth-badge';const masked=wid?wid.substring(0,4)+'***'+wid.substring(wid.length-3):'Detecting…';b.innerHTML=`<div class="hb-logo">${TOOL_NAME}</div><div class="hb-ver">v${VERSION}</div><div class="hb-wid" id="hbsn-badge-wid">${masked}</div><div class="hb-st" id="hbsn-badge-st" style="color:#f39c12">Checking…</div>`;document.body.appendChild(b);}
@@ -531,36 +279,19 @@
   function setBadgeSt(msg,color){const el=document.getElementById('hbsn-badge-st');if(!el)return;el.textContent=msg;el.style.color=color||'#f39c12';}
   function setBadgeWid(wid){const el=document.getElementById('hbsn-badge-wid');if(!el)return;el.textContent=wid.substring(0,4)+'***'+wid.substring(wid.length-3);}
 
-  // Small red top banner (Affable style) — doesn't take over the page
-  function _showAuthBanner(id, text) {
-    const make = () => {
-      if (!document.body) { setTimeout(make, 150); return; }
-      document.getElementById('hbsn-block-screen')?.remove();
-      document.getElementById('hbsn-revoked')?.remove();
-      if (document.getElementById(id)) return;
-      const d = document.createElement('div');
-      d.id = id;
-      Object.assign(d.style, {
-        position: 'fixed', top: '0', left: '0', right: '0', zIndex: '2147483647',
-        background: '#c0392b', color: '#fff', textAlign: 'center', padding: '11px 16px',
-        font: "600 14px system-ui,-apple-system,'Segoe UI',Roboto,sans-serif",
-        boxShadow: '0 2px 12px rgba(0,0,0,0.45)'
-      });
-      d.textContent = text;
-      document.body.appendChild(d);
-    };
-    make();
+  function showBlockScreen(wid,msg){
+    removeBadge();document.getElementById('hbsn-block-screen')?.remove();
+    const masked=wid?wid.substring(0,4)+'***'+wid.substring(wid.length-3):'Not detected';
+    const bl=document.createElement('div');bl.id='hbsn-block-screen';
+    bl.innerHTML=`<div class="hb-box"><div class="hb-logo-lg">🔒 ${TOOL_NAME}</div><div class="hb-sub">NOT AUTHORIZED · v${VERSION}</div><div class="hb-clock" id="bl-clk">--:--:--</div><div class="hb-date" id="bl-dt"></div><div class="hb-sep"></div><div class="hb-wid-lg">${masked}</div><div class="hb-msg">${msg||'Worker ID not authorized.'}</div><div class="hb-footer">Contact your administrator</div></div>`;
+    document.body.appendChild(bl);_startClock('bl');
   }
 
-  function showBlockScreen(wid, msg) {
-    removeBadge();
-    _showAuthBanner('hbsn-block-screen',
-      `⛔ ${TOOL_NAME}: You are NOT authorized to use this script. ${msg || 'Contact the admin.'}`);
-  }
-
-  function showRevokedScreen() {
-    _showAuthBanner('hbsn-revoked',
-      `🚫 ${TOOL_NAME}: Your access has been REVOKED. Contact the admin.`);
+  function showRevokedScreen(){
+    document.getElementById('hbsn-block-screen')?.remove();document.getElementById('hbsn-revoked')?.remove();
+    const r=document.createElement('div');r.id='hbsn-revoked';
+    r.innerHTML=`<div class="hb-box"><div class="hb-logo-lg">🚫 ${TOOL_NAME}</div><div class="hb-sub">ACCESS REVOKED · v${VERSION}</div><div class="hb-clock" id="rv-clk">--:--:--</div><div class="hb-date" id="rv-dt"></div><div class="hb-sep"></div><div class="hb-msg">Your Worker ID has been removed<br>from the authorized list.</div><div class="hb-footer">Contact your administrator</div></div>`;
+    document.body.appendChild(r);_startClock('rv');
   }
 
   function showCheckingBadge(savedId){
@@ -574,35 +305,19 @@
   /* ═══════════════════════════════════════
      GATE
   ═══════════════════════════════════════ */
-  // gate() bug #3 fix — cached workers used to wait for a full Google-Sheets round-trip
-  // on EVERY HIT open. With the aggressive auto-close, a 2-5s fetch was eating the HIT's
-  // whole processing budget. Now:
-  //   • cached + recently verified → pass immediately, no network call
-  //   • cached + stale → pass immediately AND kick off a background verify
-  //   • no cache → old detect+check path (blocking is fine, it's a first-time cost)
-  let _bgReVerifyStarted = false;
-  function gate(onPass, onFail) {
+  function gate(onPass,onFail){
     injectAuthCSS();
-    const savedId = LIC.savedWorkerId();
-    if (savedId && LIC.isLocalValid()) {
-      const fresh = (Date.now() - LIC.lastVerifiedAt()) < LIC_REVERIFY_MS;
-      if (fresh) {
-        // Trust the recent verification, don't block.
-        onPass();
-      } else {
-        // Pass through immediately, verify in the background — if it fails, we still
-        // block future HITs via showBlockScreen + release the current lock so the queue
-        // doesn't proceed to yet another HIT.
-        onPass();
-        checkSheet(savedId, (ok, reason) => {
-          if (ok) { LIC.markVerified(); }
-          else if (reason === 'network_error') { /* keep trust, retry via startBgReVerify */ }
-          else { LIC.clear(); showBlockScreen(savedId, 'Your Worker ID has been removed.'); releaseLock(); }
-        });
-      }
-      if (!_bgReVerifyStarted) { _bgReVerifyStarted = true; startBgReVerify(savedId); }
+    const savedId=LIC.savedWorkerId();
+    if(savedId&&LIC.isLocalValid()){
+      showCheckingBadge(savedId);
+      checkSheet(savedId,(ok,reason)=>{
+        removeBadge();
+        if(ok){onPass();startBgReVerify(savedId);}
+        else if(reason==='network_error'){onPass();startBgReVerify(savedId);}
+        else{LIC.clear();showBlockScreen(savedId,'Your Worker ID has been removed.');onFail();}
+      });
     } else {
-      LIC.clear(); showBadge(getWorkerID()); _detectAttempts = 0; doFullDetect(onPass, onFail);
+      LIC.clear();showBadge(getWorkerID());_detectAttempts=0;doFullDetect(onPass,onFail);
     }
   }
 
@@ -626,12 +341,11 @@
     });
   }
 
-  let _bgFails=0, _bgReVerifyInterval=null;
+  let _bgFails=0;
   function startBgReVerify(wid){
-    if(_bgReVerifyInterval) return;                              // bug #15 fix — don't stack intervals across HIT tabs
-    _bgReVerifyInterval = setInterval(()=>{
+    setInterval(()=>{
       checkSheet(wid,(ok,reason)=>{
-        if(ok){_bgFails=0; LIC.markVerified(); return;}
+        if(ok){_bgFails=0;return;}
         if(reason==='network_error'){_bgFails++;if(_bgFails>=2){_bgFails=0;}return;}
         _bgFails=0;LIC.clear();releaseLock();showRevokedScreen();
       });
@@ -643,23 +357,84 @@
   ═══════════════════════════════════════ */
   seedDefaultDB();
 
-  /* ★ Run Amazon "Server Busy" auto-dismiss before anything else.
-     Polls briefly to catch late-rendering Amazon interstitials. */
-  (function initServerBusyHandler(){
-    if(handleServerBusy()) return;
-    document.addEventListener('DOMContentLoaded',handleServerBusy);
-    let polls=0;
-    const t=setInterval(()=>{
-      if(handleServerBusy() || ++polls>20) clearInterval(t);
-    },300);
-  })();
-
-  /* ★ Arm the 20s general MTurk auto-close on every non-/tasks tab. */
-  setupGeneralAutoClose();
-
   const url     = location.href;
   const inFrame = window.self !== window.top;
-  const isOurTab = (Date.now()-GM_getValue('hbsn_tab_open',0))<120000;
+
+  /* ═══════════════════════════════════════
+     WRONG PAGE INSTANT REDIRECT (Amazon Home / MTurk Home)
+  ═══════════════════════════════════════ */
+  if (!inFrame) {
+      const cleanUrl = window.location.href.split('?')[0].replace(/\/$/, "");
+      if (cleanUrl === 'https://www.amazon.com' || cleanUrl === 'https://worker.mturk.com') {
+          console.log('[HBSN] Wrong page detected. Redirecting instantly to /tasks...');
+          window.location.replace('https://worker.mturk.com/tasks');
+          return;
+      }
+  }
+
+  /* ═══════════════════════════════════════
+     SERVER BUSY / CONTINUE SHOPPING HANDLER FIX
+  ═══════════════════════════════════════ */
+  let _serverBusyHandled = false;
+  function handleServerBusy() {
+      if (_serverBusyHandled) return true; // Stop running anything else if already handling
+
+      if (!document.body) return false;
+      const title = (document.title || '').toLowerCase();
+      const bodyText = (document.body.innerText || '').toLowerCase(); 
+      
+      if (title.includes('server busy') || bodyText.includes('continue shopping')) {
+          console.log('[HBSN] Server Busy detected. Clicking button to clear lock naturally...');
+          _serverBusyHandled = true; // Lock execution
+
+          // If it is a background HIT tab, close it immediately
+          if (window.location.href.includes('/projects/') || sessionStorage.getItem('hbsn_is_task_tab') === 'true') {
+              try { window.close(); } catch(e){}
+              return true;
+          }
+
+          // Main tab: Click the Continue button and wait for the natural page load. 
+          // (It will naturally redirect to MTurk home, which our WRONG PAGE logic will catch and send to /tasks).
+          const els = document.querySelectorAll('a, button, input');
+          let found = false;
+          for (let i = 0; i < els.length; i++) {
+              const t = (els[i].textContent || els[i].value || '').toLowerCase();
+              if (t.includes('continue')) {
+                  try { 
+                      els[i].click(); 
+                      found = true;
+                      console.log('[HBSN] Clicked "Continue shopping". Waiting for natural redirect...');
+                  } catch (e) {}
+                  break;
+              }
+          }
+
+          // Fallback redirect if button was missing
+          if (!found) {
+              setTimeout(() => { window.location.replace('https://worker.mturk.com/tasks'); }, 2000);
+          }
+
+          return true; // We handled it, do nothing else.
+      }
+      return false;
+  }
+
+  // Check for Server Busy / Continue Shopping page FIRST!
+  if (!inFrame && handleServerBusy()) {
+      return; 
+  }
+
+  // ★ SMART CLOSE LOGIC: Detects redirect AFTER submit to close background task tab
+  if (!inFrame) {
+      if (isTaskPage()) {
+          sessionStorage.setItem('hbsn_is_task_tab', 'true');
+      } else if (sessionStorage.getItem('hbsn_is_task_tab') === 'true') {
+          console.log('[HBSN] Task submitted and redirected! Closing background tab safely...');
+          showClosingBanner();
+          setTimeout(() => forceCloseTab(), 300);
+          return;
+      }
+  }
 
   function isQueuePage(){
     if(url.includes('/projects/')||url.includes('/assignments/')) return false;
@@ -669,7 +444,7 @@
     return url.includes('/assignments/')||(url.includes('/projects/')&&(url.includes('/tasks/')||url.includes('/tasks?')));
   }
 
-  // ★ SINGLETON LOGIC: Ensures only ONE Queue tab is active at a time
+  // ★ SINGLETON LOGIC: Ensures only ONE Queue tab runs the processor
   function manageQueueSingleton() {
     let tabId = sessionStorage.getItem('hbsn_queue_tab_id');
     if (!tabId) {
@@ -698,37 +473,10 @@
     return true;
   }
 
-  /* ★ TASK TAB SINGLETON: If another task tab is already alive, close ourselves */
-  function manageTaskSingleton() {
-    // Generate a unique ID for this task tab
-    let myTaskId = sessionStorage.getItem('hbsn_task_tab_id');
-    if (!myTaskId) {
-        myTaskId = Math.random().toString(36).substr(2, 9);
-        sessionStorage.setItem('hbsn_task_tab_id', myTaskId);
-    }
-
-    const activeTaskId = GM_getValue('hbsn_active_task_id', '');
-    const lastBeat = GM_getValue('hbsn_task_heartbeat', 0);
-    const now = Date.now();
-
-    // If another task tab has a recent heartbeat AND it's not us, we are the duplicate
-    if (activeTaskId && activeTaskId !== myTaskId && (now - lastBeat) < TASK_TAB_HEARTBEAT_TTL) {
-        console.warn('[HBSN] Duplicate task tab detected — closing self. Active:', activeTaskId, 'Self:', myTaskId);
-        document.body.innerHTML = '<h1 style="color:#ef4444;text-align:center;margin-top:20%;font-family:sans-serif;">Duplicate Task Tab — closing…</h1>';
-        setTimeout(() => { try{window.close();}catch(e){} }, 600);
-        return false;
-    }
-
-    // We are the active task tab — claim ownership and start heartbeat
-    GM_setValue('hbsn_active_task_id', myTaskId);
-    startTaskHeartbeat();
-    return true;
-  }
-
   // Cleanup abandoned standard MTurk submit pages
   if(!inFrame && url.includes('worker.mturk.com/projects') && !url.includes('/tasks/') && !url.includes('/assignments/')){
-    if((Date.now()-GM_getValue('hbsn_submitted',0))<60000 && isOurTab){
-      releaseLock(); clearTaskHeartbeat(); showClosingBanner(); setTimeout(()=>{GM_setValue('hbsn_tab_open',0);forceCloseTab();},400);
+    if((Date.now()-GM_getValue('hbsn_submitted',0))<60000){
+      releaseLock(); showClosingBanner(); setTimeout(()=>{GM_setValue('hbsn_tab_open',0);forceCloseTab();},400);
     }
     return;
   }
@@ -736,31 +484,16 @@
   // Route to Queue Page
   if(!inFrame && isQueuePage()){
     if (!manageQueueSingleton()) return;
-
-    // ★ Google Sheet Worker ID allowlist — block queue processing if not authorized
-    const startQueue = () => gate(runQueue, () => {
-      console.warn('[HBSN] Worker ID not authorized — queue disabled');
-    });
-    if(document.body) startQueue();
-    else document.addEventListener('DOMContentLoaded', startQueue);
+    if(document.body) runQueue(); else document.addEventListener('DOMContentLoaded', runQueue);
     return;
   }
 
   // Route to Task Page
-  if(!inFrame && isTaskPage() && isOurTab){
-    // ★ Enforce single task tab before running
-    if (!manageTaskSingleton()) return;
-
-    // ★ Google Sheet Worker ID allowlist — block HIT processing if not authorized
-    const startTask = () => gate(runParent, () => {
-      console.warn('[HBSN] Worker ID not authorized — task disabled, releasing lock');
-      clearTaskHeartbeat();
-      releaseLock();
-    });
-    if(document.body) startTask();
-    else document.addEventListener('DOMContentLoaded', startTask);
+  if(!inFrame && isTaskPage()){
+    runParent();
     return;
   }
+  
   // ★ IFRAME: poll for parent signal instead of one-shot check
   if(inFrame){
     let _ir=0;
@@ -773,146 +506,70 @@
   }
 
   /* ═══════════════════════════════════════
-     QUEUE RUNNER
+     QUEUE RUNNER (Background & Deduplication support)
   ═══════════════════════════════════════ */
   function runQueue(){
     const pageText = (document.body.innerText || '').toLowerCase();
     if (pageText.includes('already processing')) {
-      console.warn('[HBSN] "Already processing" lock detected.');
-      document.body.innerHTML = '<h1 style="color:#f59e0b;text-align:center;margin-top:20%;font-family:sans-serif;">MTurk "Already processing" lock detected.<br>Waiting 2.5s to let server catch up...</h1>';
+      document.body.innerHTML = '<h1 style="color:#f59e0b;text-align:center;margin-top:20%;font-family:sans-serif;">MTurk "Already processing" lock detected.<br>Waiting 2.5s...</h1>';
       setTimeout(() => location.reload(), 2500);
       return;
     }
 
     addQueueUI(); addDBManagerUI();
-    CAPTCHA_SYSTEM.init();
-    checkStaleLock();
 
     if(isPaused()){
-      queueMsg('⏸️ PAUSED','#f6ad55'); updatePauseBtn(); return;
+      queueMsg('⏸️ PAUSED','#f6ad55'); updatePauseBtn();
     }
 
-    // Fire processQueue as soon as any HIT completes anywhere (its tab unmarks itself in
-    // hbsn_inflight_hits) — no need to wait for the poll tick to refill a freed slot.
-    if (!window._hbsn_inflightListenerAdded) {
-      window._hbsn_inflightListenerAdded = true;
-      GM_addValueChangeListener('hbsn_inflight_hits', function(name, old_v, new_v, remote) {
-        if (remote && !isPaused()) setTimeout(processQueue, 400);
-      });
-    }
-
-    // Regular poll — picks up new Work buttons that appear as the queue refreshes,
-    // and also acts as the stale-lock reaper.
+    // Continuously scan for new HITs and open them in background
     setInterval(() => {
-      checkStaleLock();
-      processQueue();
-    }, QUEUE_POLL_MS);
+        if (!isPaused()) processAvailableHITs();
+    }, 1500);
 
-    processQueue();
+    processAvailableHITs();
   }
 
-  // Old single-HIT-at-a-time driver — replaced by processQueue() (parallel).
-  // Kept as a thin shim so any external caller (setPaused resume, etc.) still works.
-  function processNextHIT() { processQueue(); }
+  function processAvailableHITs(){
+    if(isPaused()) return;
+    cleanupActiveTasks(); // clean up dead/old tracking
 
-  function findAllWorkButtons() {
-    // No cross-row href dedup — MTurk lists 2+ accepted assignments of the same
-    // project as separate rows with the same href, and each one is a distinct HIT
-    // that must be worked. Dedupe only against buttons THIS tab already clicked
-    // (data-hbsnClicked), so the same button doesn't get re-clicked on the next tick.
-    const out = [];
-    for (const a of document.querySelectorAll('a[href^="/projects/"][href*="/tasks"]')) {
-      if (a.dataset.hbsnClicked === 'true') continue;
-      const h = a.href || a.getAttribute('href') || '';
-      if (!h) continue;
-      out.push(a);
-    }
-    for (const el of document.querySelectorAll('a,button,[role="button"],input[type="button"]')) {
-      if (out.includes(el)) continue;
-      if (el.dataset.hbsnClicked === 'true') continue;
-      const t = (el.textContent || el.value || '').trim().toLowerCase();
-      if (t === 'work' || t === 'continue working') out.push(el);
-    }
-    return out;
-  }
+    const links = Array.from(document.querySelectorAll('a[href^="/projects/"][href*="/tasks"]'));
+    let openedCount = 0;
+    const activeTasks = getActiveTasks();
+    const processedPaths = new Set(); // 1 Hit 1 Tab Fix
 
-  // Parallel queue driver — opens up to MAX_PARALLEL_HITS HITs at once. Concurrency
-  // is counted by counting live HIT-tab heartbeats in hbsn_inflight_hits (any entry
-  // beaten within HIT_ALIVE_MS is alive). Runs on a QUEUE_POLL_MS timer AND on every
-  // hbsn_inflight_hits change (so a freed slot fills within ~400ms).
-  //
-  // Dedup rule: the ONLY dedup is within-tab (data-hbsnClicked marks a Work button
-  // as clicked so it won't be re-clicked on the next scan). Same-project HITs with
-  // the same href are OPENED IN PARALLEL — MTurk hands each new tab its own
-  // assignment. A stale open cooldown (OPEN_COOLDOWN_MS) throttles bursts so newly
-  // opened HIT tabs have time to start beating before the next open decision.
-  var _lastOpen = 0;              // var so it's hoisted; processQueue may be called from the routing/gate path before this line executes
-  function processQueue() {
-    if (isPaused()) return;
+    for (const link of links) {
+        const href = link.getAttribute('href');
+        if (!href) continue;
 
-    const t = GM_getValue('hbsn_total', 0), y = GM_getValue('hbsn_yes', 0),
-          n = GM_getValue('hbsn_no', 0),   r = GM_getValue('hbsn_returned', 0);
-    const stats = `Done:${t} ✅${y} ❌${n} 🔁${r}`;
+        const basePath = href.split('?')[0]; 
+        let assignId = getAssignIdFromUrl(href) || basePath;
 
-    const inflight = inflightCount();
-    const budget   = Math.max(0, MAX_PARALLEL_HITS - inflight);
-    const btns     = findAllWorkButtons();
+        // Verify it wasn't already marked in this exact loop (Deduplication)
+        if (processedPaths.has(basePath)) {
+            link.dataset.hbsnClicked = 'true';
+            continue;
+        }
 
-    if (!btns.length && inflight === 0) {
-      queueMsg(`📭 Empty | ${stats}`, '#a78bfa');
-      return;
-    }
-    if (budget === 0) {
-      queueMsg(`⏳ ${inflight}/${MAX_PARALLEL_HITS} HITs in flight | ${stats}`, '#f6ad55');
-      return;
-    }
-    // Cooldown after a burst — let the tabs we just opened start beating before we
-    // decide to open more. Without this a rapid poll after an open sees inflight=0
-    // (tabs haven't loaded yet) and over-opens.
-    if (Date.now() - _lastOpen < OPEN_COOLDOWN_MS) {
-      queueMsg(`⏳ ${inflight}/${MAX_PARALLEL_HITS} HITs (cooldown) | ${stats}`, '#7dd3fc');
-      return;
+        if (!activeTasks[assignId] && link.dataset.hbsnClicked !== 'true') {
+            link.dataset.hbsnClicked = 'true';
+            processedPaths.add(basePath); // Mark to prevent 2nd click
+            setActiveTask(assignId);
+            
+            const fullUrl = href.startsWith('/') ? window.location.origin + href : href;
+            
+            GM_openInTab(fullUrl, { active: false, insert: true });
+            openedCount++;
+        }
     }
 
-    let opened = 0, dupSkipped = 0;
-    for (const btn of btns) {
-      if (opened >= budget) break;
-
-      let href = btn.href || btn.getAttribute('href');
-      // Resolve to absolute URL (dedup map keys off the absolute form).
-      if (href && href.startsWith('/')) href = window.location.origin + href;
-
-      // Cross-reload dedup — MTurk queue auto-refresh must not re-open the same URL.
-      // 5-minute TTL means: after the HIT has had time to run + submit + drop off queue,
-      // the URL becomes openable again (only relevant if MTurk actually re-lists it).
-      if (href && isUrlOpened(href)) {
-        btn.dataset.hbsnClicked = 'true';
-        dupSkipped++;
-        continue;
-      }
-      if (href) markUrlOpened(href);
-
-      btn.dataset.hbsnClicked = 'true';
-      GM_setValue('hbsn_tab_open', Date.now());
-
-      if (href) {
-        GM_openInTab(href, { active: false, insert: true });   // background — /tasks stays focused
-      } else {
-        btn.click();
-      }
-      opened++;
-      console.log('[HBSN] Opened HIT', href || '(click)');
+    if (openedCount > 0) {
+        queueMsg(`🟢 Opened ${openedCount} new HIT(s) in background…`, '#68d391');
+    } else {
+        const t=GM_getValue('hbsn_total',0),y=GM_getValue('hbsn_yes',0),n=GM_getValue('hbsn_no',0),r=GM_getValue('hbsn_returned',0);
+        queueMsg(`📭 Queue Scanning... | Done:${t} ✅${y} ❌${n} 🔁${r}`,'#a78bfa');
     }
-    if (dupSkipped) console.log('[HBSN] Skipped', dupSkipped, 'already-opened URL(s) this tick');
-
-    if (opened > 0) _lastOpen = Date.now();
-    const nowInflight = inflightCount();
-    queueMsg(
-      opened
-        ? `🟢 +${opened} → ${nowInflight}/${MAX_PARALLEL_HITS} HITs | ${stats}`
-        : `⏳ ${nowInflight}/${MAX_PARALLEL_HITS} HITs | ${stats}`,
-      opened ? '#68d391' : '#7dd3fc'
-    );
   }
 
   /* ═══════════════════════════════════════
@@ -934,84 +591,76 @@
   ═══════════════════════════════════════ */
   function doAnswer(choice){return doAnswerInDoc(document,choice);}
 
-  function doAnswerInDoc(doc,choice){
-    if(!doc) return false;
-    const w = choice==='yes'?'yes':'no';
+  function doAnswerInDoc(doc, choice) {
+      if (!doc) return false;
+      let clicked = false;
 
-    function deepQueryAll(root,sel){const res=[];(function walk(n){try{n.querySelectorAll(sel).forEach(e=>res.push(e));n.querySelectorAll('*').forEach(e=>{if(e.shadowRoot)walk(e.shadowRoot);});}catch(e){};})(root);return res;}
-    for(const r of deepQueryAll(doc,'input[type="radio"]')){
-      if(doc.querySelectorAll('input[type="radio"]').length && Array.from(doc.querySelectorAll('input[type="radio"]')).includes(r)) continue;
-      const lbl=r.id?doc.querySelector(`label[for="${r.id}"]`):r.closest('label');
-      const txt=[lbl?.textContent,r.value,r.name].join(' ').toLowerCase();
-      if((choice==='yes'&&(txt.includes('yes')||r.value==='1'))||(choice==='no'&&(txt.includes('no')||r.value==='0'||r.value==='2'))){
-        r.click(); return true;
+      // 1. Search all inputs directly
+      const inputs = doc.querySelectorAll('input[type="radio"], input[type="checkbox"]');
+      for (const r of inputs) {
+          const val = (r.value || '').toLowerCase();
+          let labelTxt = '';
+          if (r.id) {
+              const lbl = doc.querySelector(`label[for="${r.id}"]`);
+              if (lbl) labelTxt = (lbl.innerText || lbl.textContent || '').toLowerCase();
+          }
+          const parentTxt = (r.parentElement ? (r.parentElement.innerText || r.parentElement.textContent || '') : '').toLowerCase();
+          const combined = [val, labelTxt, parentTxt].join(' ').trim();
+          
+          let isYes = combined.includes('yes') || val === '1' || val === 'true' || combined.includes('relevant');
+          let isNo = combined.includes('no') || val === '2' || val === '0' || val === 'false' || combined.includes('irrelevant');
+          
+          if (isYes && isNo) { 
+              isYes = (val === '1' || val === 'yes' || val === 'true');
+              isNo = (val === '2' || val === 'no' || val === '0' || val === 'false');
+          }
+
+          if ((choice === 'yes' && isYes) || (choice === 'no' && isNo)) {
+              r.checked = true;
+              r.click();
+              r.dispatchEvent(new Event('change', { bubbles: true }));
+              r.dispatchEvent(new Event('input', { bubbles: true }));
+              clicked = true;
+          }
       }
-    }
+      if (clicked) return true;
 
-    for(const cr of doc.querySelectorAll('crowd-radio-button')){
-      const rawText=(cr.textContent||'').toLowerCase().replace(/\s+/g,' ').trim();
-      const firstWord=rawText.split(' ')[0];
-      const attrVal=(cr.getAttribute('value')||'').toLowerCase().trim();
-      const v=attrVal||firstWord;
-      const isMatch = (choice==='yes' && (v.startsWith('yes')||v==='1'||v==='true'||v==='relevant')) ||
-                      (choice==='no'  && (v.startsWith('no') ||v==='0'||v==='2'||v==='false'||v==='irrelevant'));
-      if(isMatch){
-        console.log('[HBSN] ✔ crowd-radio-button native click, value='+v);
-        cr.click();
-        setTimeout(() => {
-          cr.dispatchEvent(new Event('change',{bubbles:true,composed:true}));
-          const grp = cr.closest('crowd-radio-group');
-          if(grp) grp.dispatchEvent(new Event('change',{bubbles:true,composed:true}));
-        }, 50);
-        return true;
+      // 2. Crowd elements
+      for (const cr of doc.querySelectorAll('crowd-radio-button, crowd-checkbox')) {
+          const rawText = (cr.textContent || '').toLowerCase().replace(/\s+/g, ' ').trim();
+          const v = (cr.getAttribute('value') || cr.getAttribute('name') || rawText.split(' ')[0] || '').toLowerCase();
+          const isMatch = (choice === 'yes' && (v.startsWith('yes') || v === '1' || v === 'true')) ||
+                          (choice === 'no'  && (v.startsWith('no') || v === '0' || v === '2' || v === 'false'));
+          if (isMatch) {
+              cr.click();
+              setTimeout(() => {
+                  cr.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+                  const grp = cr.closest('crowd-radio-group');
+                  if (grp) grp.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+              }, 50);
+              return true;
+          }
       }
-    }
 
-    for(const cr of doc.querySelectorAll('crowd-checkbox')){
-      const v=(cr.getAttribute('value')||cr.getAttribute('name')||cr.textContent||'').toLowerCase().trim();
-      const isMatch = (choice==='yes' && ['yes','1','true','relevant'].includes(v)) ||
-                      (choice==='no'  && ['no','0','2','false','irrelevant'].includes(v));
-      if(isMatch){
-        cr.click();
-        return true;
+      // 3. Visual Text matching for specific HITs 
+      for (const el of doc.querySelectorAll('tr, td, li, div, button, span, label')) {
+          const t = (el.innerText || el.textContent || '').trim().toLowerCase().replace(/\s+/g, ' ');
+          if (t.length > 30) continue; 
+
+          if ((choice === 'yes' && (t === 'yes 1' || t === 'yes' || t === '1' || t.startsWith('yes'))) ||
+              (choice === 'no'  && (t === 'no 2' || t === 'no' || t === '2' || t.startsWith('no')))) {
+              deepClick(el);
+              const r = el.querySelector('input[type="radio"]');
+              if (r) {
+                  r.checked = true;
+                  r.click();
+                  r.dispatchEvent(new Event('change', { bubbles: true }));
+              }
+              clicked = true;
+              break;
+          }
       }
-    }
-
-    for(const r of doc.querySelectorAll('input[type="radio"]')){
-      const lbl=r.id?doc.querySelector(`label[for="${r.id}"]`):r.closest('label');
-      const txt=[lbl?.textContent,r.value].join(' ').toLowerCase();
-      if((choice==='yes'&&(txt.includes('yes')||r.value==='1'))||
-         (choice==='no'&&(txt.includes('no')||r.value==='0'||r.value==='2'))){
-        r.click(); return true;
-      }
-    }
-
-    for(const td of doc.querySelectorAll('td')){
-      const f=td.textContent.trim().toLowerCase().split(/[\s\t]+/)[0];
-      if(f===w){
-        const tr=td.closest('tr');
-        if(tr){
-          const radioInRow=tr.querySelector('input[type="radio"]');
-          if(radioInRow){radioInRow.click();}
-        }
-        deepClick(td);if(tr)deepClick(tr);return true;
-      }
-    }
-    for(const tr of doc.querySelectorAll('tr')){
-      if(tr.textContent.trim().toLowerCase().split(/[\s\t]+/)[0]===w){
-        const radioInRow=tr.querySelector('input[type="radio"]');
-        if(radioInRow){radioInRow.click();}
-        deepClick(tr);return true;
-      }
-    }
-
-    for(const el of doc.querySelectorAll('span,div,button,li,label,a,p,th,[role="radio"],[role="button"]')){
-      const t=el.textContent.trim();
-      if(t.length>20||el.childElementCount>3)continue;
-      if(t.toLowerCase().split(/[\s\t]+/)[0]===w){el.click();return true;}
-    }
-
-    return false;
+      return clicked;
   }
 
   function doAnswerEverywhere(choice){
@@ -1026,51 +675,31 @@
      ★ SUBMIT ENGINE
   ═══════════════════════════════════════ */
   function submitLoop(n){
-    const inFrameCtx = window.self !== window.top;
     if(n > MAX_SUBMIT_TRIES){
       taskStatus('⚠️ All submit methods exhausted — trying external submit…');
       if(externalSubmit()){
         taskStatus('🚀 External submit fired! Waiting for redirect...');
-        if(!inFrameCtx && typeof window.__hbsn_submitted === 'function') window.__hbsn_submitted();
       } else {
-        // Bug #2 fix — iframes must NOT release shared lock/heartbeat; only the top-level
-        // task tab owns those. Iframes just report failure via postMessage.
-        if(inFrameCtx){
-          taskStatus('❌ iframe submit failed — signalling parent');
-          try{ window.top.postMessage({type:'HBSN_SUBMIT_FAILED'},'*'); }catch(e){}
-        } else {
-          taskStatus('❌ Could not submit — releasing lock');
-          clearTaskHeartbeat();
-          releaseLock();
-        }
+        taskStatus('❌ Could not submit.');
       }
       return;
     }
 
-    if(n>0 && n%10===0) console.log(`[HBSN] Submit attempt ${n}/${MAX_SUBMIT_TRIES}…`);
-
     let clicked = false;
-
     if(attemptSubmit(document)){
       clicked = true;
     } else {
       for(const ifr of document.querySelectorAll('iframe')){
         try{
-          if(attemptSubmit(ifr.contentDocument)){
-            clicked = true; break;
-          }
+          if(attemptSubmit(ifr.contentDocument)){ clicked = true; break; }
         }catch(e){}
       }
     }
 
     if (clicked) {
       console.log('[HBSN] 🚀 Submit button clicked natively.');
-      markSubmitted();
-      // Tell runParent's beforeunload that this HIT truly submitted (bug #2 fix).
-      if(!inFrameCtx && typeof window.__hbsn_submitted === 'function') window.__hbsn_submitted();
       taskStatus('🚀 Submit clicked! Waiting for page to redirect...');
       showFlash('🚀','#22c55e');
-
       setTimeout(() => submitLoop(n+1), 6000);
     } else {
       setTimeout(()=>submitLoop(n+1), SUBMIT_RETRY_MS);
@@ -1082,7 +711,6 @@
 
     let btn = findSubmitBtn(doc) || doc.querySelector('crowd-button[form-action="submit"]');
     if(btn){
-      console.log('[HBSN] Found standard/crowd submit button in light DOM');
       btn.removeAttribute('disabled');
       btn.disabled = false;
       btn.click();
@@ -1093,7 +721,6 @@
     if(cf && cf.shadowRoot){
       const shadowBtn = cf.shadowRoot.querySelector('button[type="submit"], input[type="submit"], button');
       if(shadowBtn){
-        console.log('[HBSN] Found button in crowd-form shadow DOM');
         shadowBtn.removeAttribute('disabled');
         shadowBtn.disabled = false;
         shadowBtn.click();
@@ -1104,13 +731,11 @@
     for(const form of doc.querySelectorAll('form')){
       const action = (form.action||'').toLowerCase();
       if(action.includes('mturk') || action.includes('submit') || action.includes('external') || action.length > 10){
-        console.log('[HBSN] S4: form.submit() action='+action.substring(0,60));
         try{form.requestSubmit();return true;}catch(e){
           try{form.submit();return true;}catch(e2){}
         }
       }
     }
-
     return false;
   }
 
@@ -1166,8 +791,6 @@
     return true;
   }
 
-  function markSubmitted(){ GM_setValue('hbsn_submitted',Date.now()); }
-
   function findReturnButton(){
     for(const b of document.querySelectorAll('button,a,input,[role="button"]')){
       const t=(b.textContent||b.value||'').trim().toLowerCase();
@@ -1177,10 +800,11 @@
   }
 
   function forceCloseTab(){
-    clearTaskHeartbeat();
+    let assignId = getAssignIdFromUrl(window.location.href);
+    if(assignId) removeActiveTask(assignId);
+    
     try{window.close();}catch(e){}
     setTimeout(()=>{try{window.open('','_self');window.close();}catch(e){}},150);
-    setTimeout(()=>{try{document.body.innerHTML='<h1 style="color:#22c55e;text-align:center;margin-top:20%">Task Completed ✅<br><span style="font-size:16px;color:#94a3b8">You can close this tab safely.</span></h1>';}catch(e){}},300);
   }
 
   /* ═══════════════════════════════════════
@@ -1188,61 +812,15 @@
   ═══════════════════════════════════════ */
   function runParent(){
     let done=false;
-    let submitted=false;                   // bug #2 fix — separate from `done` (which flips as soon as an answer is chosen)
-    // Unique per-tab heartbeat key. Two HITs of the same project get DIFFERENT keys,
-    // so the queue counts them both as live in flight.
-    const myHitKey = 'hit_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
-    markHITInflight(myHitKey);                         // first beat — timestamp = now
-    // Refresh the beat every 3s so this tab counts toward inflight for as long as it's alive.
-    // Background-tab throttling can slow the interval down; HIT_ALIVE_MS (15s) covers a
-    // clamp of up to ~5x the interval, which is plenty for a foreground-throttled tab.
-    const _beatInterval = setInterval(() => markHITInflight(myHitKey), 3000);
-    function stopBeat() {
-      try { clearInterval(_beatInterval); } catch(e) {}
-      unmarkHITInflight(myHitKey);
-    }
-    // Called by submitLoop / return paths the moment the HIT is TRULY submitted.
-    // Frees the parallel-queue slot so a new HIT can open in its place.
-    window.__hbsn_submitted = () => {
-      submitted = true;
-      stopBeat();
-    };
     const ver=getVer();
+
+    window.addEventListener('beforeunload', () => { 
+        let assignId = getAssignIdFromUrl(window.location.href) || window.location.href;
+        removeActiveTask(assignId);
+    });
 
     addTaskUI('…','🔍 Scanning…');
     taskStatus('⏳ Waiting for page to load…');
-    GM_setValue('hbsn_time',Date.now());
-
-    // Bug #14 — captcha detection must be running even during the (now non-blocking) gate check.
-    CAPTCHA_SYSTEM.init();
-
-    // Bug #1 safety net — HIT tabs no longer have the 20s general auto-close, so if the whole
-    // flow somehow never completes (submit exhausted, page frozen), force-close after 90s.
-    // Skipped while a real CAPTCHA is being solved so the user isn't cut off.
-    const _safety = setTimeout(() => {
-      if (submitted) return;                         // normal flow already handled it
-      if (CAPTCHA_SYSTEM.active) return;             // user is solving — give more time
-      console.warn('[HBSN] HIT safety timer ('+HIT_SAFETY_CLOSE_MS+'ms) — force closing');
-      taskStatus('⏰ Safety timer — force closing…');
-      markSubmitted();
-      clearTaskHeartbeat();
-      releaseLock();
-      stopBeat();                                    // free the parallel slot so the queue can retry (or move on)
-      forceCloseTab();
-    }, HIT_SAFETY_CLOSE_MS);
-    window.addEventListener('beforeunload', () => { try { clearTimeout(_safety); } catch(e) {} });
-
-    // Beforeunload should ONLY release the lock if submission truly never started (bug #2 fix).
-    // Between "answer chosen" (done=true) and "submit clicked" (submitted=true), releasing the lock
-    // makes the queue grab another HIT while this one is still in flight.
-    // Regardless of submission state, ALWAYS free the parallel inflight slot on unload so the
-    // queue tab isn't left thinking this HIT is still running when its tab is already gone.
-    window.addEventListener('beforeunload', () => {
-      stopBeat();
-      if (submitted) return;                         // real submit happened — cleanup path handles it
-      // Still not submitted → free the lock so queue can move on, but only if we truly own it.
-      if (_iOwnTaskSingleton()) { clearTaskHeartbeat(); releaseLock(); }
-    });
 
     /* Cross-Origin Iframe Detection */
     window.addEventListener('message',e=>{
@@ -1255,10 +833,6 @@
             updateTaskUIChoice('return','📝 "26 Item Match"');
 
             setTimeout(()=>{
-                markSubmitted();
-                if (typeof window.__hbsn_submitted === 'function') window.__hbsn_submitted();  // bug #2 + parallel — mark done and free the slot
-                clearTaskHeartbeat();
-                releaseLock();
                 try {
                     const scr = document.createElement('script');
                     scr.textContent = 'window.confirm = function() { return true; };';
@@ -1267,8 +841,7 @@
 
                 const btn=findReturnButton();
                 if(btn){
-                    btn.click();
-                    setTimeout(() => forceCloseTab(), 1000);
+                    btn.click(); 
                     return;
                 }
                 const m=url.match(/assignments\/([A-Z0-9]+)/i);
@@ -1276,7 +849,6 @@
                     location.href=`https://worker.mturk.com/assignments/${m[1]}/return`;
                     return;
                 }
-                forceCloseTab();
             },600);
         }
 
@@ -1319,10 +891,6 @@
          updateTaskUIChoice('return','📝 "'+label+'"');
 
          setTimeout(()=>{
-           markSubmitted();
-           if (typeof window.__hbsn_submitted === 'function') window.__hbsn_submitted();  // bug #2 + parallel — 26-list return counts as completion
-           clearTaskHeartbeat();
-           releaseLock();
            try {
                const scr = document.createElement('script');
                scr.textContent = 'window.confirm = function() { return true; };';
@@ -1330,17 +898,9 @@
            } catch(e){}
 
            const btn=findReturnButton();
-           if(btn){
-               btn.click();
-               setTimeout(() => forceCloseTab(), 1000);
-               return;
-           }
+           if(btn){ btn.click(); return; }
            const m=url.match(/assignments\/([A-Z0-9]+)/i);
-           if(m){
-               location.href=`https://worker.mturk.com/assignments/${m[1]}/return`;
-               return;
-           }
-           forceCloseTab();
+           if(m){ location.href=`https://worker.mturk.com/assignments/${m[1]}/return`; return; }
          },600);
          return;
       }
@@ -1358,10 +918,6 @@
           updateTaskUIChoice('return','📝 "'+label+'"');
 
           setTimeout(()=>{
-            markSubmitted();
-            if (typeof window.__hbsn_submitted === 'function') window.__hbsn_submitted();  // bug #2 + parallel — V2-match return counts as completion
-            clearTaskHeartbeat();
-            releaseLock();
             try {
                const scr = document.createElement('script');
                scr.textContent = 'window.confirm = function() { return true; };';
@@ -1369,10 +925,9 @@
             } catch(e){}
 
             const btn=findReturnButton();
-            if(btn){btn.click(); setTimeout(() => forceCloseTab(), 1000); return;}
+            if(btn){ btn.click(); return; }
             const m=url.match(/assignments\/([A-Z0-9]+)/i);
-            if(m){location.href=`https://worker.mturk.com/assignments/${m[1]}/return`;return;}
-            forceCloseTab();
+            if(m){ location.href=`https://worker.mturk.com/assignments/${m[1]}/return`; return; }
           },600);
           return;
         }
@@ -1539,15 +1094,21 @@
   function tellParent(){try{window.top.postMessage({type:'HBSN_DONE'},'*');}catch(e){}}
 
   /* ═══════════════════════════════════════
-     UTILITY
+     UTILITY (Enhanced Key Events)
   ═══════════════════════════════════════ */
   function fireKey(key){
     const kc=key.charCodeAt(0);
-    [document.activeElement,document.body,document.documentElement].filter(Boolean).forEach(t=>{
-      ['keydown','keypress','keyup'].forEach(ev=>{
-        try{t.dispatchEvent(new KeyboardEvent(ev,{key,code:'Digit'+key,keyCode:kc,which:kc,
-          charCode:ev==='keypress'?kc:0,bubbles:true,cancelable:true,composed:true}));}catch(e){}
-      });
+    const events = ['keydown', 'keypress', 'keyup'];
+    const targets = [document.activeElement, document.body, document.documentElement, window];
+    targets.filter(Boolean).forEach(t => {
+        events.forEach(ev => {
+            try {
+                t.dispatchEvent(new KeyboardEvent(ev, {
+                    key: key, code: 'Digit' + key, keyCode: kc, which: kc, charCode: ev === 'keypress' ? kc : 0,
+                    bubbles: true, cancelable: true, composed: true
+                }));
+            } catch (e) {}
+        });
     });
   }
 
@@ -1704,12 +1265,12 @@
 
   function showClosingBanner(){
     GM_addStyle(`#hbsn-closing{position:fixed;top:0;left:0;right:0;bottom:0;z-index:999999;background:#0f172a;color:#fbbf24;font:24px 'Segoe UI',sans-serif;display:flex;align-items:center;justify-content:center}`);
-    const b=document.createElement('div');b.id='hbsn-closing';b.textContent='✅ Task Closed';
+    const b=document.createElement('div');b.id='hbsn-closing';b.textContent='✅ Task Closed Successfully';
     try{document.body.innerHTML='';}catch(e){}
     document.body.appendChild(b);
   }
   function queueMsg(t,c){const m=document.getElementById('hbsn-qm'),d=document.getElementById('hbsn-qd');if(m)m.textContent=t;if(d){d.style.background=c;d.style.animation='blink 1s infinite';}}
   function taskStatus(t){const el=document.getElementById('hbsn-ts');if(el)el.textContent=t;console.log(`[${TOOL_NAME}]`,t);}
-  function showFlash(txt,color){const el=document.getElementById('hbsn-fl');if(!el)return;el.textContent=txt;el.style.color=color;el.style.opacity='1';}
+  function showFlash(txt,color){const el=document.getElementById('hbsn-fl');if(!el)return;el.textContent=txt;el.style.color=color;el.style.opacity='1';setTimeout(()=>el.style.opacity='0',500);}
 
 })();
