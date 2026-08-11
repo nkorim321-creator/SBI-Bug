@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         HasanBhaierSalamNin36.0
 // @namespace    https://worker.mturk.com/
-// @version      34.0
-// @description  Fixes v34 — HIT tabs no longer auto-closed at 20s (they now get a 90s safety net); gate() is non-blocking for cached workers (fresh sheet check runs in background); heartbeat/lock TTLs raised to survive Chrome background-tab throttling; iframe lock/heartbeat writes fenced off; beforeunload releases lock only when submission truly never started; cleanup helpers now clear singleton + interval; queue stale-lock polled every 5s. Queue processor. Strict 1-Tab Queue enforcement. Auto-captcha detect+alert+resume. Amazon "Server Busy" auto-dismiss. Default mode V2. Google Sheet Worker ID allowlist enforced.
+// @version      34.1
+// @description  v34.1 — parallel HIT queue (up to MAX_PARALLEL_HITS at once), per-HIT dedup so the same HIT is never opened twice. HIT tabs open in background (no focus theft) and free their slot the moment they truly submit. All v34.0 fixes still in: 90s HIT safety net, non-blocking gate() for cached workers, raised heartbeat/lock TTLs, iframe write fence, per-tab beforeunload correctness, auto-captcha, Server-Busy dismiss, Sheet allowlist.
 // @author       Custom Script
 // @match        https://worker.mturk.com/*
 // @match        https://*.mturk.com/*
@@ -44,6 +44,9 @@
   const TASK_TAB_HEARTBEAT_TTL = 90000;           // raised — background-tab timer throttling can clamp the 2s heartbeat, TTL must survive Chrome's ~1min clamp
   const LIC_REVERIFY_MS  = 15 * 60 * 1000;        // skip a fresh sheet check within this window (uses last-verified stamp); keeps HIT open fast for cached workers
   const HIT_SAFETY_CLOSE_MS = 90000;              // safety net for HIT tabs that never navigate away (submit truly failed) — much longer than a normal answer+submit cycle
+  const MAX_PARALLEL_HITS   = 5;                  // how many HIT tabs can be in flight at once (queue opens up to this many in parallel)
+  const HIT_INFLIGHT_TTL    = 3 * 60 * 1000;      // per-HIT dedup entry TTL — keeps a HIT from being re-opened within this window even if the tab is closed early
+  const QUEUE_POLL_MS       = 2500;               // how often the queue re-scans for new Work buttons and opens them (respects MAX_PARALLEL_HITS)
 
   /* ═══════════════════════════════════════
      STRICT 26 RETURN TEXTS
@@ -142,6 +145,44 @@
       console.warn('[HBSN] Stale lock — releasing'); releaseLock();
     }
   }
+
+  /* ─── Per-HIT inflight tracking (parallel opens + dedup) ─── */
+  // A shared map { hitKey: openedAtTimestamp } stored in GM state. Anything older
+  // than HIT_INFLIGHT_TTL is treated as stale and swept every time we read the map,
+  // so a HIT that opened but never completed gets a chance to be re-opened later.
+  function hitKeyFromHref(href) {
+    if (!href) return null;
+    let m = href.match(/\/projects\/([A-Z0-9]+)\/tasks/i);
+    if (m) return 'p:' + m[1];
+    m = href.match(/\/assignments\/([A-Z0-9]+)/i);
+    if (m) return 'a:' + m[1];
+    return null;
+  }
+  function getInflightHITs() {
+    try {
+      const map = JSON.parse(GM_getValue('hbsn_inflight_hits', '{}')) || {};
+      const now = Date.now();
+      let mutated = false;
+      for (const k of Object.keys(map)) {
+        if (now - (map[k] || 0) > HIT_INFLIGHT_TTL) { delete map[k]; mutated = true; }
+      }
+      if (mutated) GM_setValue('hbsn_inflight_hits', JSON.stringify(map));
+      return map;
+    } catch (e) { return {}; }
+  }
+  function markHITInflight(key) {
+    if (!key) return;
+    const m = getInflightHITs();
+    m[key] = Date.now();
+    GM_setValue('hbsn_inflight_hits', JSON.stringify(m));
+  }
+  function unmarkHITInflight(key) {
+    if (!key) return;
+    const m = getInflightHITs();
+    if (m[key]) { delete m[key]; GM_setValue('hbsn_inflight_hits', JSON.stringify(m)); }
+  }
+  function isHITInflight(key) { return !!key && !!getInflightHITs()[key]; }
+  function inflightCount() { return Object.keys(getInflightHITs()).length; }
 
   /* ─── Task-tab heartbeat ─── */
   function isTaskTabAlive() {
@@ -722,80 +763,109 @@
       queueMsg('⏸️ PAUSED','#f6ad55'); updatePauseBtn(); return;
     }
 
-    if (!window._hbsn_lockListenerAdded) {
-        window._hbsn_lockListenerAdded = true;
-        GM_addValueChangeListener('hbsn_lock', function(name, old_value, new_value, remote) {
-            if (new_value === 0 && remote && !isPaused()) {
-                setTimeout(processNextHIT, 1500);
-            }
-        });
+    // Fire processQueue as soon as any HIT completes anywhere (its tab unmarks itself in
+    // hbsn_inflight_hits) — no need to wait for the poll tick to refill a freed slot.
+    if (!window._hbsn_inflightListenerAdded) {
+      window._hbsn_inflightListenerAdded = true;
+      GM_addValueChangeListener('hbsn_inflight_hits', function(name, old_v, new_v, remote) {
+        if (remote && !isPaused()) setTimeout(processQueue, 400);
+      });
     }
 
-    // Bug #11 fix — the stale-lock reaper wasn't on a timer; a truly stuck lock would
-    // hang the queue forever until the user reloaded manually. Poll every 5s.
+    // Regular poll — picks up new Work buttons that appear as the queue refreshes,
+    // and also acts as the stale-lock reaper.
     setInterval(() => {
-      const wasLocked = isLocked();
       checkStaleLock();
-      if (wasLocked && !isLocked() && !isPaused()) processNextHIT();
-    }, 5000);
+      processQueue();
+    }, QUEUE_POLL_MS);
 
-    processNextHIT();
+    processQueue();
   }
 
-  function processNextHIT(){
-    if(isPaused()) return;
-    checkStaleLock();
+  // Old single-HIT-at-a-time driver — replaced by processQueue() (parallel).
+  // Kept as a thin shim so any external caller (setPaused resume, etc.) still works.
+  function processNextHIT() { processQueue(); }
 
-    // ★ DOUBLE GUARD: Don't open if lock is held OR if a task tab is still alive
-    if(isLocked() || isTaskTabAlive()){
-      const t=GM_getValue('hbsn_total',0),y=GM_getValue('hbsn_yes',0),
-            n=GM_getValue('hbsn_no',0),r=GM_getValue('hbsn_returned',0);
-      const reason = isLocked() ? 'locked' : 'task tab alive';
-      queueMsg(`⏳ HIT processing (${reason})… Done:${t} ✅${y} ❌${n} 🔁${r}`,'#f6ad55');
+  function findAllWorkButtons() {
+    const seen = new Set();          // dedupe by href within THIS scan
+    const out = [];
+    // Preferred: direct HIT-page links, in DOM order
+    for (const a of document.querySelectorAll('a[href^="/projects/"][href*="/tasks"]')) {
+      if (a.dataset.hbsnClicked === 'true') continue;
+      const h = a.href || a.getAttribute('href') || '';
+      if (!h || seen.has(h)) continue;
+      seen.add(h);
+      out.push(a);
+    }
+    // Fallback: any element whose visible label is "Work" / "Continue working"
+    for (const el of document.querySelectorAll('a,button,[role="button"],input[type="button"]')) {
+      if (out.includes(el)) continue;
+      if (el.dataset.hbsnClicked === 'true') continue;
+      const t = (el.textContent || el.value || '').trim().toLowerCase();
+      if (t === 'work' || t === 'continue working') out.push(el);
+    }
+    return out;
+  }
+
+  // Parallel queue driver — opens up to MAX_PARALLEL_HITS HITs at once, skipping any
+  // HIT already in flight (dedup via hitKeyFromHref). Runs on a QUEUE_POLL_MS timer
+  // AND on every hbsn_inflight_hits change, so a freshly-freed slot fills immediately
+  // when a HIT completes.
+  function processQueue() {
+    if (isPaused()) return;
+
+    const t = GM_getValue('hbsn_total', 0), y = GM_getValue('hbsn_yes', 0),
+          n = GM_getValue('hbsn_no', 0),   r = GM_getValue('hbsn_returned', 0);
+    const stats = `Done:${t} ✅${y} ❌${n} 🔁${r}`;
+
+    const inflight = inflightCount();
+    const budget   = Math.max(0, MAX_PARALLEL_HITS - inflight);
+    const btns     = findAllWorkButtons();
+
+    if (!btns.length && inflight === 0) {
+      queueMsg(`📭 Empty | ${stats}`, '#a78bfa');
+      return;
+    }
+    if (budget === 0) {
+      queueMsg(`⏳ ${inflight}/${MAX_PARALLEL_HITS} HITs in flight | ${stats}`, '#f6ad55');
       return;
     }
 
-    const workBtn=findWorkButton();
-    if(workBtn){
-      acquireLock();
-      GM_setValue('hbsn_tab_open',Date.now());
-      workBtn.dataset.hbsnClicked = 'true';
-      queueMsg('🟢 Opening HIT…','#68d391');
+    let opened = 0, skipped = 0;
+    for (const btn of btns) {
+      if (opened >= budget) break;
 
-      setTimeout(()=>{
-        // ★ Final check right before opening — abort if a task tab appeared in the meantime
-        if(isTaskTabAlive()){
-          console.warn('[HBSN] Task tab appeared during delay — aborting open');
-          releaseLock();
-          return;
-        }
-        let href = workBtn.href || workBtn.getAttribute('href');
-        if (href) {
-            if (href.startsWith('/')) { href = window.location.origin + href; }
-            // active:false — open HIT tab in background so the /tasks queue tab stays focused
-            GM_openInTab(href, {active: false, insert: true});
-        } else {
-            workBtn.click();
-        }
-        queueMsg('⏳ HIT open — processing…','#7dd3fc');
-      },300);
-    } else {
-      const t=GM_getValue('hbsn_total',0),y=GM_getValue('hbsn_yes',0),
-            n=GM_getValue('hbsn_no',0),r=GM_getValue('hbsn_returned',0);
-      queueMsg(`📭 Empty | Done:${t} ✅${y} ❌${n} 🔁${r}`,'#a78bfa');
-    }
-  }
+      let href = btn.href || btn.getAttribute('href');
+      const key = hitKeyFromHref(href || '');
 
-  function findWorkButton(){
-    const links = document.querySelectorAll('a[href^="/projects/"][href*="/tasks"]');
-    for (const a of links) {
-        if (a.dataset.hbsnClicked !== 'true') return a;
+      // Same HIT already opened in another tab (or by an earlier tick) — never open twice.
+      if (key && isHITInflight(key)) {
+        btn.dataset.hbsnClicked = 'true';
+        skipped++;
+        continue;
+      }
+
+      if (key) markHITInflight(key);
+      btn.dataset.hbsnClicked = 'true';
+      GM_setValue('hbsn_tab_open', Date.now());
+
+      if (href) {
+        if (href.startsWith('/')) href = window.location.origin + href;
+        GM_openInTab(href, { active: false, insert: true });   // background — /tasks stays focused
+      } else {
+        btn.click();
+      }
+      opened++;
+      console.log('[HBSN] Opened HIT', key || '(no key)', href || '(click)');
     }
-    for(const el of document.querySelectorAll('a,button,[role="button"],input[type="button"]')){
-      const t=(el.textContent||el.value||'').trim().toLowerCase();
-      if((t==='work'||t==='continue working') && el.dataset.hbsnClicked !== 'true') return el;
-    }
-    return null;
+
+    const nowInflight = inflightCount();
+    queueMsg(
+      opened
+        ? `🟢 +${opened} → ${nowInflight}/${MAX_PARALLEL_HITS} HITs${skipped ? ' (skipped ' + skipped + ' dup)' : ''} | ${stats}`
+        : `⏳ ${nowInflight}/${MAX_PARALLEL_HITS} HITs${skipped ? ' (skipped ' + skipped + ' dup)' : ''} | ${stats}`,
+      opened ? '#68d391' : '#7dd3fc'
+    );
   }
 
   /* ═══════════════════════════════════════
@@ -1072,7 +1142,14 @@
   function runParent(){
     let done=false;
     let submitted=false;                   // bug #2 fix — separate from `done` (which flips as soon as an answer is chosen)
-    window.__hbsn_submitted = () => { submitted = true; };
+    const myHitKey = hitKeyFromHref(location.href);
+    if (myHitKey) markHITInflight(myHitKey);           // parallel dedup — also ensures this HIT is tracked even if the queue didn't add it (direct install, manual open)
+    // Called by submitLoop / return paths the moment the HIT is TRULY submitted.
+    // Frees the parallel-queue slot so a new HIT can open in its place.
+    window.__hbsn_submitted = () => {
+      submitted = true;
+      if (myHitKey) unmarkHITInflight(myHitKey);
+    };
     const ver=getVer();
 
     addTaskUI('…','🔍 Scanning…');
@@ -1093,6 +1170,7 @@
       markSubmitted();
       clearTaskHeartbeat();
       releaseLock();
+      if (myHitKey) unmarkHITInflight(myHitKey);     // free the parallel slot so the queue can retry (or move on)
       forceCloseTab();
     }, HIT_SAFETY_CLOSE_MS);
     window.addEventListener('beforeunload', () => { try { clearTimeout(_safety); } catch(e) {} });
@@ -1100,7 +1178,10 @@
     // Beforeunload should ONLY release the lock if submission truly never started (bug #2 fix).
     // Between "answer chosen" (done=true) and "submit clicked" (submitted=true), releasing the lock
     // makes the queue grab another HIT while this one is still in flight.
+    // Regardless of submission state, ALWAYS free the parallel inflight slot on unload so the
+    // queue tab isn't left thinking this HIT is still running when its tab is already gone.
     window.addEventListener('beforeunload', () => {
+      if (myHitKey) unmarkHITInflight(myHitKey);
       if (submitted) return;                         // real submit happened — cleanup path handles it
       // Still not submitted → free the lock so queue can move on, but only if we truly own it.
       if (_iOwnTaskSingleton()) { clearTaskHeartbeat(); releaseLock(); }
@@ -1118,7 +1199,7 @@
 
             setTimeout(()=>{
                 markSubmitted();
-                submitted = true;                      // bug #2 — return path is a valid completion
+                if (typeof window.__hbsn_submitted === 'function') window.__hbsn_submitted();  // bug #2 + parallel — mark done and free the slot
                 clearTaskHeartbeat();
                 releaseLock();
                 try {
@@ -1182,7 +1263,7 @@
 
          setTimeout(()=>{
            markSubmitted();
-           submitted = true;                          // bug #2 — 26-list return path is a valid completion
+           if (typeof window.__hbsn_submitted === 'function') window.__hbsn_submitted();  // bug #2 + parallel — 26-list return counts as completion
            clearTaskHeartbeat();
            releaseLock();
            try {
@@ -1221,7 +1302,7 @@
 
           setTimeout(()=>{
             markSubmitted();
-            submitted = true;                         // bug #2 — V2-match return path is a valid completion
+            if (typeof window.__hbsn_submitted === 'function') window.__hbsn_submitted();  // bug #2 + parallel — V2-match return counts as completion
             clearTaskHeartbeat();
             releaseLock();
             try {
