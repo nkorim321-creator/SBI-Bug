@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HasanBhaierSalamNin36.0
 // @namespace    https://worker.mturk.com/
-// @version      34.3
+// @version      34.4
 // @description  v34.2 — fix: same-project HITs (2 assignments of one batch shown as duplicate rows in queue) now open in PARALLEL instead of the 2nd being dropped as a dup. Concurrency counted by per-HIT-tab heartbeats (unique per tab, refreshed every 3s) so two same-URL HITs are correctly counted as two. Everything else from v34.1: parallel queue, background tabs, safety net, non-blocking gate, sheet allowlist.
 // @author       Custom Script
 // @match        https://worker.mturk.com/*
@@ -49,6 +49,7 @@
   const HIT_ALIVE_MS        = 15000;              // heartbeat freshness — an entry counts toward inflight only if beaten within this
   const OPEN_COOLDOWN_MS    = 3000;               // after opening HIT tabs, wait this long before opening more — gives fresh tabs time to start their heartbeat
   const QUEUE_POLL_MS       = 2500;               // how often the queue re-scans for new Work buttons and opens them (respects MAX_PARALLEL_HITS)
+  const OPENED_URL_TTL_MS   = 5 * 60 * 1000;      // remember a Work-button URL as "already opened" for this long across page reloads — MTurk queue auto-refresh must not re-open the same HIT
 
   /* ═══════════════════════════════════════
      STRICT 26 RETURN TEXTS
@@ -185,6 +186,32 @@
     for (const ts of Object.values(map)) if (now - ts < HIT_ALIVE_MS) n++;
     return n;
   }
+
+  /* ─── Opened-URL dedup (survives queue-page auto-reloads) ─── */
+  // MTurk queue can auto-refresh every few seconds (via Panda Crazy Max or similar).
+  // Each refresh wipes the DOM, so `data-hbsnClicked` marks are lost and the same
+  // Work button re-appears looking fresh. We persist opened URLs in GM state with a
+  // 5-minute TTL so no matter how many times the queue reloads, a given URL is
+  // opened at most once within that window.
+  function getOpenedUrls() {
+    try {
+      const map = JSON.parse(GM_getValue('hbsn_opened_urls', '{}')) || {};
+      const now = Date.now();
+      let mutated = false;
+      for (const k of Object.keys(map)) {
+        if (now - (map[k] || 0) > OPENED_URL_TTL_MS) { delete map[k]; mutated = true; }
+      }
+      if (mutated) GM_setValue('hbsn_opened_urls', JSON.stringify(map));
+      return map;
+    } catch (e) { return {}; }
+  }
+  function markUrlOpened(url) {
+    if (!url) return;
+    const m = getOpenedUrls();
+    m[url] = Date.now();
+    GM_setValue('hbsn_opened_urls', JSON.stringify(m));
+  }
+  function isUrlOpened(url) { return !!url && !!getOpenedUrls()[url]; }
 
   /* ─── Task-tab heartbeat ─── */
   function isTaskTabAlive() {
@@ -847,16 +874,28 @@
       return;
     }
 
-    let opened = 0;
+    let opened = 0, dupSkipped = 0;
     for (const btn of btns) {
       if (opened >= budget) break;
 
       let href = btn.href || btn.getAttribute('href');
+      // Resolve to absolute URL (dedup map keys off the absolute form).
+      if (href && href.startsWith('/')) href = window.location.origin + href;
+
+      // Cross-reload dedup — MTurk queue auto-refresh must not re-open the same URL.
+      // 5-minute TTL means: after the HIT has had time to run + submit + drop off queue,
+      // the URL becomes openable again (only relevant if MTurk actually re-lists it).
+      if (href && isUrlOpened(href)) {
+        btn.dataset.hbsnClicked = 'true';
+        dupSkipped++;
+        continue;
+      }
+      if (href) markUrlOpened(href);
+
       btn.dataset.hbsnClicked = 'true';
       GM_setValue('hbsn_tab_open', Date.now());
 
       if (href) {
-        if (href.startsWith('/')) href = window.location.origin + href;
         GM_openInTab(href, { active: false, insert: true });   // background — /tasks stays focused
       } else {
         btn.click();
@@ -864,6 +903,7 @@
       opened++;
       console.log('[HBSN] Opened HIT', href || '(click)');
     }
+    if (dupSkipped) console.log('[HBSN] Skipped', dupSkipped, 'already-opened URL(s) this tick');
 
     if (opened > 0) _lastOpen = Date.now();
     const nowInflight = inflightCount();
