@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         SBI 37.1
+// @name         SBI 37.2
 // @namespace    https://worker.mturk.com/
-// @version      37.1
-// @description  Queue processor & Task auto-answer. Default Mode V2. Multiple background tabs (Strictly 1 Tab per HIT), Duplicate Prevention, Smart Close, Fixed Server Busy Loop.
+// @version      37.2
+// @description  v37.2 — answer engine now traverses shadow DOM (fixes SBI HITs where Yes/No lives inside crowd-form's shadow root and used to be missed → force-submit-without-answer → HIT returned). Force-submit fallback replaced with an explicit RETURN of the HIT (MTurk-neutral, no rejection stat).
 // @author       Custom Script
 // @match        https://worker.mturk.com/*
 // @match        https://*.mturk.com/*
@@ -591,70 +591,103 @@
   ═══════════════════════════════════════ */
   function doAnswer(choice){return doAnswerInDoc(document,choice);}
 
+  // Shadow-DOM-aware querySelectorAll — recurses into every open shadow root under `root`.
+  // SBI-style HITs render Yes/No options inside <crowd-form>'s shadow root, so a plain
+  // doc.querySelectorAll misses them entirely and the answer engine kept coming up empty.
+  function deepQueryAll(root, selector) {
+    const out = [];
+    if (!root || !root.querySelectorAll) return out;
+    try { root.querySelectorAll(selector).forEach(el => out.push(el)); } catch (e) {}
+    try {
+      root.querySelectorAll('*').forEach(el => {
+        if (el.shadowRoot) out.push(...deepQueryAll(el.shadowRoot, selector));
+      });
+    } catch (e) {}
+    return out;
+  }
+
+  function _isYesLabel(t) {
+    const s = (t || '').toLowerCase().trim();
+    return s === 'yes' || s === 'y' || s === '1' || s === 'yes 1' || s === '1 yes' ||
+           s === 'true' || s === 'relevant' || s.startsWith('yes ') || s.startsWith('yes\n');
+  }
+  function _isNoLabel(t) {
+    const s = (t || '').toLowerCase().trim();
+    return s === 'no' || s === 'n' || s === '2' || s === 'no 2' || s === '2 no' ||
+           s === '0' || s === 'false' || s === 'irrelevant' || s.startsWith('no ') || s.startsWith('no\n');
+  }
+
   function doAnswerInDoc(doc, choice) {
       if (!doc) return false;
+      const wantYes = choice === 'yes';
       let clicked = false;
 
-      // 1. Search all inputs directly
-      const inputs = doc.querySelectorAll('input[type="radio"], input[type="checkbox"]');
-      for (const r of inputs) {
+      // 1. Native radio / checkbox (light DOM AND shadow DOM)
+      for (const r of deepQueryAll(doc, 'input[type="radio"], input[type="checkbox"]')) {
           const val = (r.value || '').toLowerCase();
           let labelTxt = '';
-          if (r.id) {
-              const lbl = doc.querySelector(`label[for="${r.id}"]`);
+          if (r.id && r.getRootNode) {
+              const rootN = r.getRootNode();
+              const lbl = rootN.querySelector && rootN.querySelector(`label[for="${r.id}"]`);
               if (lbl) labelTxt = (lbl.innerText || lbl.textContent || '').toLowerCase();
           }
           const parentTxt = (r.parentElement ? (r.parentElement.innerText || r.parentElement.textContent || '') : '').toLowerCase();
           const combined = [val, labelTxt, parentTxt].join(' ').trim();
-          
-          let isYes = combined.includes('yes') || val === '1' || val === 'true' || combined.includes('relevant');
-          let isNo = combined.includes('no') || val === '2' || val === '0' || val === 'false' || combined.includes('irrelevant');
-          
-          if (isYes && isNo) { 
-              isYes = (val === '1' || val === 'yes' || val === 'true');
-              isNo = (val === '2' || val === 'no' || val === '0' || val === 'false');
-          }
 
-          if ((choice === 'yes' && isYes) || (choice === 'no' && isNo)) {
-              r.checked = true;
-              r.click();
-              r.dispatchEvent(new Event('change', { bubbles: true }));
-              r.dispatchEvent(new Event('input', { bubbles: true }));
+          let isYes = _isYesLabel(val) || labelTxt.includes('yes') || combined.includes('relevant') && !combined.includes('irrelevant');
+          let isNo  = _isNoLabel(val)  || labelTxt.includes('no')  || combined.includes('irrelevant');
+          if (isYes && isNo) { isYes = _isYesLabel(val); isNo = _isNoLabel(val); }
+
+          if ((wantYes && isYes) || (!wantYes && isNo)) {
+              try { r.checked = true; } catch (e) {}
+              try { r.click(); } catch (e) {}
+              try { r.dispatchEvent(new Event('change', { bubbles: true })); } catch (e) {}
+              try { r.dispatchEvent(new Event('input',  { bubbles: true })); } catch (e) {}
               clicked = true;
           }
       }
       if (clicked) return true;
 
-      // 2. Crowd elements
-      for (const cr of doc.querySelectorAll('crowd-radio-button, crowd-checkbox')) {
+      // 2. Amazon Crowd elements (deep — they live in shadow roots for crowd-form)
+      for (const cr of deepQueryAll(doc, 'crowd-radio-button, crowd-checkbox, crowd-tile')) {
           const rawText = (cr.textContent || '').toLowerCase().replace(/\s+/g, ' ').trim();
-          const v = (cr.getAttribute('value') || cr.getAttribute('name') || rawText.split(' ')[0] || '').toLowerCase();
-          const isMatch = (choice === 'yes' && (v.startsWith('yes') || v === '1' || v === 'true')) ||
-                          (choice === 'no'  && (v.startsWith('no') || v === '0' || v === '2' || v === 'false'));
-          if (isMatch) {
-              cr.click();
+          const attrVal = (cr.getAttribute('value') || cr.getAttribute('name') || '').toLowerCase().trim();
+          const first   = rawText.split(' ')[0] || '';
+          const v = attrVal || first;
+          const isYes = _isYesLabel(v) || _isYesLabel(rawText);
+          const isNo  = _isNoLabel(v)  || _isNoLabel(rawText);
+          if ((wantYes && isYes) || (!wantYes && isNo)) {
+              try { cr.click(); } catch (e) {}
+              try { deepClick(cr); } catch (e) {}
               setTimeout(() => {
-                  cr.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
-                  const grp = cr.closest('crowd-radio-group');
-                  if (grp) grp.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+                  try { cr.dispatchEvent(new Event('change', { bubbles: true, composed: true })); } catch (e) {}
+                  const grp = cr.closest && cr.closest('crowd-radio-group');
+                  if (grp) { try { grp.dispatchEvent(new Event('change', { bubbles: true, composed: true })); } catch (e) {} }
               }, 50);
               return true;
           }
       }
 
-      // 3. Visual Text matching for specific HITs 
-      for (const el of doc.querySelectorAll('tr, td, li, div, button, span, label')) {
+      // 3. ARIA-role radios/options — some HITs use divs with role="radio"/"option"
+      for (const el of deepQueryAll(doc, '[role="radio"], [role="option"], [role="menuitemradio"]')) {
           const t = (el.innerText || el.textContent || '').trim().toLowerCase().replace(/\s+/g, ' ');
-          if (t.length > 30) continue; 
+          if ((wantYes && _isYesLabel(t)) || (!wantYes && _isNoLabel(t))) {
+              try { el.click(); deepClick(el); } catch (e) {}
+              clicked = true;
+              break;
+          }
+      }
+      if (clicked) return true;
 
-          if ((choice === 'yes' && (t === 'yes 1' || t === 'yes' || t === '1' || t.startsWith('yes'))) ||
-              (choice === 'no'  && (t === 'no 2' || t === 'no' || t === '2' || t.startsWith('no')))) {
-              deepClick(el);
-              const r = el.querySelector('input[type="radio"]');
+      // 4. Visual text match on any small clickable — SBI-style panels with "Yes 1" / "No 2"
+      for (const el of deepQueryAll(doc, 'tr, td, li, div, button, span, label, a')) {
+          const t = (el.innerText || el.textContent || '').trim().toLowerCase().replace(/\s+/g, ' ');
+          if (!t || t.length > 30) continue;
+          if ((wantYes && _isYesLabel(t)) || (!wantYes && _isNoLabel(t))) {
+              try { deepClick(el); } catch (e) {}
+              const r = el.querySelector && el.querySelector('input[type="radio"], input[type="checkbox"]');
               if (r) {
-                  r.checked = true;
-                  r.click();
-                  r.dispatchEvent(new Event('change', { bubbles: true }));
+                  try { r.checked = true; r.click(); r.dispatchEvent(new Event('change', { bubbles: true })); } catch (e) {}
               }
               clicked = true;
               break;
@@ -664,10 +697,37 @@
   }
 
   function doAnswerEverywhere(choice){
+    // Try direct DOM click first (across shadow roots).
     if(doAnswerInDoc(document,choice)) return true;
     for(const ifr of document.querySelectorAll('iframe')){
       try{if(doAnswerInDoc(ifr.contentDocument,choice)) return true;}catch(e){}
     }
+    // SBI panels natively listen to keyboard "1" / "2" — fire the shortcut as a
+    // second try so the answer registers even if the panel is inside a shadow root
+    // we couldn't traverse (or the click target has a different structure).
+    try { fireKey(choice === 'yes' ? '1' : '2'); } catch(e) {}
+    // One more DOM sweep after the shortcut — the panel may have redrawn.
+    if(doAnswerInDoc(document,choice)) return true;
+    for(const ifr of document.querySelectorAll('iframe')){
+      try{if(doAnswerInDoc(ifr.contentDocument,choice)) return true;}catch(e){}
+    }
+    return false;
+  }
+
+  // Helper — RETURN the current HIT (used when we can't answer). Returning is
+  // MTurk-neutral: no rejection stat, no bad submission. Better than force-submit
+  // with no answer selected (which MTurk rejects).
+  function returnCurrentHIT() {
+    try {
+      const scr = document.createElement('script');
+      scr.textContent = 'window.confirm = function() { return true; };';
+      document.documentElement.appendChild(scr); scr.remove();
+    } catch (e) {}
+    GM_setValue('hbsn_returned', (GM_getValue('hbsn_returned', 0)) + 1);
+    const btn = findReturnButton();
+    if (btn) { try { btn.click(); } catch (e) {} return true; }
+    const m = url.match(/assignments\/([A-Z0-9]+)/i);
+    if (m) { try { location.href = 'https://worker.mturk.com/assignments/' + m[1] + '/return'; } catch (e) {} return true; }
     return false;
   }
 
@@ -970,18 +1030,18 @@
           clearInterval(ansTimer);
           if(!done){
             done=true;
-            taskStatus('⚠️ Could not find answer — force submitting anyway…');
-            fireKey(choice==='yes'?'1':'2');
-            document.querySelectorAll('iframe').forEach(f=>{
-              try{f.contentWindow.postMessage({type:'HBSN_PICK',choice},'*');}catch(e){}
-              try{f.contentWindow.postMessage({type:'HBSN_SUBMIT'},'*');}catch(e){}
-            });
-            setTimeout(()=>{
-               document.querySelectorAll('iframe').forEach(f=>{
-                  try{f.contentWindow.postMessage({type:'HBSN_SUBMIT'},'*');}catch(e){}
-               });
-               submitLoop(0);
-            },1500);
+            // No answer element found after all retries.
+            // Old behavior force-submitted without an answer → MTurk rejected → HIT counted
+            // as "returned/rejected" in stats (this is the rocket-then-return bug).
+            // New behavior: RETURN the HIT explicitly. Return is MTurk-neutral, no rejection
+            // hit, and the queue moves on cleanly. The rule DB stat tick was already applied
+            // above, so re-count as a return.
+            taskStatus('⚠️ Could not find answer — returning HIT (no garbage submit)');
+            showFlash('🔁','#f6ad55');
+            // Undo the wrongly-attributed yes/no counter — this became a return, not an answer.
+            if (choice === 'yes') GM_setValue('hbsn_yes', Math.max(0, GM_getValue('hbsn_yes', 0) - 1));
+            else                  GM_setValue('hbsn_no',  Math.max(0, GM_getValue('hbsn_no',  0) - 1));
+            setTimeout(returnCurrentHIT, 400);
           }
           return;
         }
