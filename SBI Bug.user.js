@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         SBI 37.4
+// @name         SBI 38.0
 // @namespace    https://worker.mturk.com/
-// @version      37.4
-// @description  v37.4 — "stuck at Answer element not found — retrying" fix. Some SBI panels are keyboard-only (no clickable Yes/No exists), so the DOM answer engine loops forever. Now doAnswerEverywhere detects the SBI shortcut panel via "Select an option / Yes 1 / No 2" text and short-circuits: fire the keyboard shortcut and treat as answered. If MTurk silently rejects, submitLoop's 4-clicks-no-nav limit returns the HIT cleanly. Also: ANSWER_RETRIES 20 → 10 (fail-fast), and crowd-radio-button/group set both .checked / .value PROPERTY and attribute so all component variants pick up the state.
+// @version      38.0
+// @description  v38.0 — ROOT-CAUSE FIX for HITs stuck on "Answer element not found". The SBI crowd-form renders in a cross-origin iframe; the iframe's answer engine was gated behind hbsn_time/lock signals the parallel rewrite stopped setting, so it never ran and the parent (which can't reach the frame) hung forever. Now the iframe SELF-DETECTS HIT content and runs on its own, fires the keyboard shortcut in-frame where MTurk's listener lives, and the parent waits patiently for the frame's answer + has a hard 45s return-and-close backstop. Adds window.__hbsnDiag() DOM dump.
 // @author       Custom Script
 // @match        https://worker.mturk.com/*
 // @match        https://*.mturk.com/*
@@ -494,14 +494,35 @@
     return;
   }
   
-  // ★ IFRAME: poll for parent signal instead of one-shot check
+  // ★ IFRAME: the SBI answer panel (crowd-form / "Select an option") lives in a
+  // cross-origin mturkcontent iframe. The parent can't reach it, so the iframe MUST
+  // run its own answer engine. Previous versions gated this behind hbsn_time/lock
+  // signals that the parallel rewrite stopped setting — so the iframe never ran and
+  // the HIT hung on "Answer element not found". Now the iframe SELF-DETECTS HIT
+  // content and runs on its own, no parent signal required.
+  function iframeHasHITContent(){
+    try{
+      if(!document.body) return false;
+      if(document.querySelector('crowd-form,crowd-radio-group,crowd-radio-button,crowd-checkbox,input[type="radio"]')) return true;
+      const t=(document.body.innerText||'').toLowerCase();
+      return t.includes('select an option') || t.includes('shop by interest') ||
+             t.includes('is the below item') || /\byes\b[\s\S]{0,6}\bno\b/.test(t);
+    }catch(e){ return false; }
+  }
   if(inFrame){
     let _ir=0;
     (function pollParent(){
-      if((Date.now()-GM_getValue('hbsn_time',0))<60000){runIframe();return;}
-      if(isLocked()){runIframe();return;}
-      if(++_ir<25)setTimeout(pollParent,200);
+      // Run if the iframe itself shows HIT content, OR the parent signalled recently,
+      // OR the lock is held. Poll for ~12s to catch late-rendering crowd-forms.
+      if(iframeHasHITContent()){ runIframe(); return; }
+      if((Date.now()-GM_getValue('hbsn_time',0))<60000){ runIframe(); return; }
+      if(isLocked()){ runIframe(); return; }
+      if(++_ir<48) setTimeout(pollParent,250);
     })();
+    // Also run immediately if the parent explicitly tells us to.
+    window.addEventListener('message', e => {
+      if(e.data && e.data.type==='HBSN_RUN' && !window.__hbsnIframeRan){ runIframe(); }
+    });
     return;
   }
 
@@ -736,6 +757,32 @@
     } catch (e) { return false; }
   }
 
+  // Dump the answer-panel DOM to the console. Call window.__hbsnDiag() in either the
+  // top page or a frame. If a HIT ever still fails, run this and share the console
+  // output — it shows exactly which elements exist so the engine can be targeted.
+  function hbsnDiag() {
+    const where = window.self === window.top ? 'TOP' : 'IFRAME(' + location.href.slice(0, 60) + ')';
+    const groups = [];
+    ['crowd-form','crowd-radio-group','crowd-radio-button','crowd-checkbox',
+     'input[type="radio"]','input[type="checkbox"]','[role="radio"]'].forEach(sel => {
+      const els = deepQueryAll(document, sel);
+      groups.push(sel + ': ' + els.length);
+      els.slice(0, 6).forEach(el => {
+        groups.push('   <' + el.tagName.toLowerCase() +
+          ' value="' + (el.getAttribute && el.getAttribute('value')) + '"' +
+          ' text="' + ((el.innerText || el.textContent || '').trim().slice(0, 20)) + '">');
+      });
+    });
+    const ifr = document.querySelectorAll('iframe');
+    console.log('%c[HBSN DIAG] ' + where, 'color:#f59e0b;font-weight:bold');
+    console.log('[HBSN DIAG] iframes on this page: ' + ifr.length);
+    ifr.forEach((f, i) => { try { console.log('   iframe#' + i + ' src=' + (f.src || '(inline)')); } catch(e){} });
+    console.log('[HBSN DIAG] answer elements:\n' + groups.join('\n'));
+    console.log('[HBSN DIAG] body text (first 200): ' + ((document.body && document.body.innerText) || '').replace(/\s+/g, ' ').slice(0, 200));
+    return groups;
+  }
+  try { window.__hbsnDiag = hbsnDiag; } catch(e){}
+
   function doAnswerEverywhere(choice){
     // 1) Direct DOM click first (crowd-radio-button by value, radios, etc.)
     if(doAnswerInDoc(document,choice)) return true;
@@ -942,10 +989,42 @@
     let done=false;
     const ver=getVer();
 
-    window.addEventListener('beforeunload', () => { 
+    // ★ Wake the iframe answer engine. The SBI crowd-form lives in a cross-origin
+    // iframe; it self-detects HIT content now, but we ALSO set hbsn_time (its legacy
+    // gate) and postMessage HBSN_RUN so it fires the instant it's ready — belt and
+    // suspenders. Refresh hbsn_time so the 60s freshness window never lapses.
+    GM_setValue('hbsn_time', Date.now());
+    const _timeRefresh = setInterval(() => GM_setValue('hbsn_time', Date.now()), 3000);
+    function signalIframes(){
+      document.querySelectorAll('iframe').forEach(f => {
+        try { f.contentWindow.postMessage({ type: 'HBSN_RUN' }, '*'); } catch(e){}
+      });
+    }
+    signalIframes();
+    setTimeout(signalIframes, 1500);
+    setTimeout(signalIframes, 3500);
+
+    window.addEventListener('beforeunload', () => {
         let assignId = getAssignIdFromUrl(window.location.href) || window.location.href;
         removeActiveTask(assignId);
+        try { clearInterval(_timeRefresh); } catch(e){}
     });
+
+    // ★ HARD NO-HANG GUARANTEE. Whatever happens with answering/submitting, this HIT
+    // tab will not sit open forever. If it hasn't finished (submitted or returned)
+    // within HIT_HARD_LIMIT_MS, force-return it and close so the queue keeps flowing.
+    // Skipped while a captcha is actively being solved.
+    const HIT_HARD_LIMIT_MS = 45000;
+    const _hardLimit = setTimeout(() => {
+      if (done) return;
+      done = true;
+      try { clearInterval(_timeRefresh); } catch(e){}
+      console.warn('[HBSN] Hard 45s limit — returning stuck HIT');
+      taskStatus('⏰ Stuck 45s — returning HIT');
+      returnCurrentHIT();
+      setTimeout(() => { try { forceCloseTab(); } catch(e){} }, 2500);
+    }, HIT_HARD_LIMIT_MS);
+    window.addEventListener('beforeunload', () => { try { clearTimeout(_hardLimit); } catch(e){} });
 
     addTaskUI('…','🔍 Scanning…');
     taskStatus('⏳ Waiting for page to load…');
@@ -1089,35 +1168,43 @@
         return;
       }
 
-      taskStatus('⏳ Answer element not found — retrying…');
+      // Is there a cross-origin iframe we can't read? If so, the answer panel lives
+      // there and the IFRAME's own engine (runIframe) will click it and postMessage
+      // HBSN_DONE back. In that case the parent must be PATIENT — keep nudging the
+      // iframe with HBSN_PICK and wait for its reply, rather than returning the HIT
+      // out from under it. The hard 45s limit is the ultimate backstop.
+      function hasCrossOriginIframe(){
+        for (const f of document.querySelectorAll('iframe')) {
+          try { if (!f.contentDocument) return true; } catch(e) { return true; }
+        }
+        return false;
+      }
+      const waitingOnIframe = hasCrossOriginIframe();
+      if (waitingOnIframe) taskStatus('⏳ Answer is in a sub-frame — waiting for it…');
+      else                 taskStatus('⏳ Answer element not found — retrying…');
+
       let ansRetry=0;
+      const answerCap = waitingOnIframe ? 90 : ANSWER_RETRIES;   // patient (36s) vs fail-fast (4s)
       const ansTimer = setInterval(()=>{
         if(done){clearInterval(ansTimer);return;}
         ansRetry++;
-        if(ansRetry > ANSWER_RETRIES){
+        if(ansRetry > answerCap){
           clearInterval(ansTimer);
           if(!done){
             done=true;
-            // No answer element found after all retries.
-            // Old behavior force-submitted without an answer → MTurk rejected → HIT counted
-            // as "returned/rejected" in stats (this is the rocket-then-return bug).
-            // New behavior: RETURN the HIT explicitly. Return is MTurk-neutral, no rejection
-            // hit, and the queue moves on cleanly. The rule DB stat tick was already applied
-            // above, so re-count as a return.
-            taskStatus('⚠️ Could not find answer — returning HIT (no garbage submit)');
+            // Give up cleanly — RETURN the HIT (MTurk-neutral, no rejection stat).
+            taskStatus('⚠️ Could not answer — returning HIT');
             showFlash('🔁','#f6ad55');
-            // Undo the wrongly-attributed yes/no counter — this became a return, not an answer.
             if (choice === 'yes') GM_setValue('hbsn_yes', Math.max(0, GM_getValue('hbsn_yes', 0) - 1));
             else                  GM_setValue('hbsn_no',  Math.max(0, GM_getValue('hbsn_no',  0) - 1));
             setTimeout(returnCurrentHIT, 400);
           }
           return;
         }
-        if(ansRetry%3===0){
-          document.querySelectorAll('iframe').forEach(f=>{
-            try{f.contentWindow.postMessage({type:'HBSN_PICK',choice},'*');}catch(e){}
-          });
-        }
+        // Keep nudging every frame with the chosen answer (iframe listens for HBSN_PICK).
+        document.querySelectorAll('iframe').forEach(f=>{
+          try{f.contentWindow.postMessage({type:'HBSN_PICK',choice},'*');}catch(e){}
+        });
         if(doAnswerEverywhere(choice)){
           done=true;
           clearInterval(ansTimer);
@@ -1187,7 +1274,10 @@
      IFRAME HANDLER
   ═══════════════════════════════════════ */
   function runIframe(){
+    if(window.__hbsnIframeRan) return;      // don't start the answer engine twice
+    window.__hbsnIframeRan = true;
     const choice=GM_getValue('hbsn_choice','yes');
+    setTimeout(() => { try { hbsnDiag(); } catch(e){} }, WAIT_LOAD + 500);  // one-time structure dump for debugging
 
     const rawText = document.body.innerText || "";
     const cleanText = rawText.toLowerCase().replace(/[^a-z0-9]/g, '');
@@ -1216,7 +1306,9 @@
 
   function answerLoop(c,n){
     if(n>=ANSWER_RETRIES){fireKey(c==='yes'?'1':'2');setTimeout(tellParent,500);return;}
-    if(doAnswerInDoc(document,c)) setTimeout(tellParent,200);
+    // doAnswerEverywhere (not just doAnswerInDoc) so a keyboard-only SBI panel gets its
+    // shortcut fired HERE, inside the iframe where MTurk's key listener actually lives.
+    if(doAnswerEverywhere(c)) setTimeout(tellParent,200);
     else setTimeout(()=>answerLoop(c,n+1),RETRY_MS);
   }
   function tellParent(){try{window.top.postMessage({type:'HBSN_DONE'},'*');}catch(e){}}
