@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         SBI 38.0
+// @name         SBI 38.1
 // @namespace    https://worker.mturk.com/
-// @version      38.0
-// @description  v38.0 — ROOT-CAUSE FIX for HITs stuck on "Answer element not found". The SBI crowd-form renders in a cross-origin iframe; the iframe's answer engine was gated behind hbsn_time/lock signals the parallel rewrite stopped setting, so it never ran and the parent (which can't reach the frame) hung forever. Now the iframe SELF-DETECTS HIT content and runs on its own, fires the keyboard shortcut in-frame where MTurk's listener lives, and the parent waits patiently for the frame's answer + has a hard 45s return-and-close backstop. Adds window.__hbsnDiag() DOM dump.
+// @version      38.1
+// @description  v38.1 — fixes the crash the v38.0 diagnostic caught (MAX_CLICK_STICKY_TRIES TDZ ReferenceError that crashed every submit). Also: the live diagnostic showed SBI options are NOT crowd-radio-buttons — they're custom elements — so tier-4 now picks the shortest exact "Yes/No" cell and clicks it AND its ancestor chain (handler often on a parent row) + sets aria/data/class state. Enhanced window.__hbsnDiag() dumps option candidates + custom elements.
 // @author       Custom Script
 // @match        https://worker.mturk.com/*
 // @match        https://*.mturk.com/*
@@ -41,6 +41,11 @@
   const YES_PERCENT      = 60;
   const STALE_LOCK_MS    = 25000;
   const ANSWER_RETRIES   = 10;                    // was 20 — with the SBI-panel short-circuit in doAnswerEverywhere we should never need this many; failing faster means a truly-unanswerable HIT gets returned in ~4s instead of ~8s
+  // Cap "clicked submit but page never navigated" retries. Must live in CONFIG (top of
+  // module) — declaring it next to submitLoop put it in the temporal dead zone, and
+  // submitLoop can be called during init (iframe HBSN_SUBMIT), throwing a ReferenceError
+  // that crashed every submit. This is the bug the diagnostic caught in v38.0.
+  const MAX_CLICK_STICKY_TRIES = 4;
 
   /* ═══════════════════════════════════════
      STRICT 26 RETURN TEXTS
@@ -726,19 +731,37 @@
       }
       if (clicked) return true;
 
-      // 4. Visual text match on any small clickable — SBI-style panels with "Yes 1" / "No 2"
-      for (const el of deepQueryAll(doc, 'tr, td, li, div, button, span, label, a')) {
-          const t = (el.innerText || el.textContent || '').trim().toLowerCase().replace(/\s+/g, ' ');
-          if (!t || t.length > 30) continue;
-          if ((wantYes && _isYesLabel(t)) || (!wantYes && _isNoLabel(t))) {
+      // 4. Visual text match on any small clickable — SBI-style panels with "Yes 1" / "No 2".
+      // The diagnostic on the live HIT showed NO crowd-radio-button — the options are
+      // custom elements. The onclick handler often sits on a PARENT row, not the text
+      // node we match, so click the matched element AND walk up clicking each ancestor
+      // (bounded), plus set common data-* / aria state. First exact-label match wins.
+      const candidates = deepQueryAll(doc, 'tr, td, li, div, button, span, label, a, p');
+      // Prefer exact "yes"/"no"/"yes 1"/"no 2" (the option cell) over longer text.
+      let best = null, bestLen = 999;
+      for (const el of candidates) {
+          let t;
+          try { t = (el.innerText || el.textContent || '').trim().toLowerCase().replace(/\s+/g, ' '); } catch (e) { continue; }
+          if (!t || t.length > 18) continue;
+          const hit = (wantYes && _isYesLabel(t)) || (!wantYes && _isNoLabel(t));
+          if (hit && t.length < bestLen) { best = el; bestLen = t.length; }
+      }
+      if (best) {
+          const chain = [];
+          let cur = best;
+          for (let i = 0; i < 4 && cur && cur.tagName; i++) { chain.push(cur); cur = cur.parentElement; }
+          // Click the option and its ancestors (one of them carries the handler).
+          for (const el of chain) {
               try { deepClick(el); } catch (e) {}
-              const r = el.querySelector && el.querySelector('input[type="radio"], input[type="checkbox"]');
-              if (r) {
-                  try { r.checked = true; r.click(); r.dispatchEvent(new Event('change', { bubbles: true })); } catch (e) {}
-              }
-              clicked = true;
-              break;
+              try {
+                  el.setAttribute && el.setAttribute('aria-checked', 'true');
+                  if (el.classList) el.classList.add('selected', 'active', 'checked');
+              } catch (e) {}
           }
+          // Register any hidden input inside the option.
+          const r = best.querySelector && best.querySelector('input[type="radio"], input[type="checkbox"]');
+          if (r) { try { r.checked = true; r.click(); r.dispatchEvent(new Event('change', { bubbles: true })); } catch (e) {} }
+          clicked = true;
       }
       return clicked;
   }
@@ -757,29 +780,64 @@
     } catch (e) { return false; }
   }
 
-  // Dump the answer-panel DOM to the console. Call window.__hbsnDiag() in either the
-  // top page or a frame. If a HIT ever still fails, run this and share the console
-  // output — it shows exactly which elements exist so the engine can be targeted.
-  function hbsnDiag() {
-    const where = window.self === window.top ? 'TOP' : 'IFRAME(' + location.href.slice(0, 60) + ')';
-    const groups = [];
-    ['crowd-form','crowd-radio-group','crowd-radio-button','crowd-checkbox',
-     'input[type="radio"]','input[type="checkbox"]','[role="radio"]'].forEach(sel => {
-      const els = deepQueryAll(document, sel);
-      groups.push(sel + ': ' + els.length);
-      els.slice(0, 6).forEach(el => {
-        groups.push('   <' + el.tagName.toLowerCase() +
-          ' value="' + (el.getAttribute && el.getAttribute('value')) + '"' +
-          ' text="' + ((el.innerText || el.textContent || '').trim().slice(0, 20)) + '">');
-      });
+  // Describe an element compactly for the diagnostic log.
+  function _descEl(el) {
+    if (!el || !el.tagName) return '(none)';
+    const attrs = [];
+    if (el.id) attrs.push('id=' + el.id);
+    if (el.className && typeof el.className === 'string') attrs.push('cls=' + el.className.trim().slice(0, 40));
+    ['value','name','role','tabindex','data-value','data-key','data-answer','aria-checked','aria-label'].forEach(a => {
+      const v = el.getAttribute && el.getAttribute(a);
+      if (v != null) attrs.push(a + '=' + v);
     });
-    const ifr = document.querySelectorAll('iframe');
+    return '<' + el.tagName.toLowerCase() + ' ' + attrs.join(' ') +
+           '> "' + ((el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 25)) + '"';
+  }
+
+  // Dump the answer-panel DOM to the console. Call window.__hbsnDiag() in any frame.
+  function hbsnDiag() {
+    const where = window.self === window.top ? 'TOP' : 'IFRAME(' + location.href.slice(0, 55) + ')';
     console.log('%c[HBSN DIAG] ' + where, 'color:#f59e0b;font-weight:bold');
-    console.log('[HBSN DIAG] iframes on this page: ' + ifr.length);
-    ifr.forEach((f, i) => { try { console.log('   iframe#' + i + ' src=' + (f.src || '(inline)')); } catch(e){} });
-    console.log('[HBSN DIAG] answer elements:\n' + groups.join('\n'));
-    console.log('[HBSN DIAG] body text (first 200): ' + ((document.body && document.body.innerText) || '').replace(/\s+/g, ' ').slice(0, 200));
-    return groups;
+
+    // 1) Standard selectors (deep).
+    const groups = [];
+    ['crowd-form','crowd-classifier','crowd-radio-group','crowd-radio-button','crowd-checkbox',
+     'crowd-button','input[type="radio"]','input[type="checkbox"]','[role="radio"]','[role="button"]',
+     'button','[data-value]','[data-key]','[onclick]'].forEach(sel => {
+      const els = deepQueryAll(document, sel);
+      if (els.length) {
+        groups.push(sel + ': ' + els.length);
+        els.slice(0, 4).forEach(el => groups.push('   ' + _descEl(el)));
+      }
+    });
+    console.log('[HBSN DIAG] element counts:\n' + groups.join('\n'));
+
+    // 2) Any element whose short text is exactly/starts-with yes/no/1/2 — the actual options.
+    const opts = [];
+    deepQueryAll(document, '*').forEach(el => {
+      if (opts.length >= 14) return;
+      let t;
+      try { t = (el.innerText || el.textContent || '').trim().toLowerCase().replace(/\s+/g, ' '); } catch(e){ return; }
+      if (!t || t.length > 12) return;                       // short only — option cells, not containers
+      if (/^(yes|no)\b/.test(t) || t === '1' || t === '2' || t === 'yes 1' || t === 'no 2') {
+        // Only leaf-ish nodes (few children) to avoid dumping wrappers.
+        if (el.childElementCount <= 3) opts.push(_descEl(el));
+      }
+    });
+    console.log('[HBSN DIAG] Yes/No option candidates (' + opts.length + '):\n' + opts.join('\n'));
+
+    // 3) All custom elements (tag has a dash) — SBI may use a bespoke web component.
+    const customs = [];
+    deepQueryAll(document, '*').forEach(el => {
+      if (customs.length >= 12) return;
+      if (el.tagName && el.tagName.includes('-')) customs.push(el.tagName.toLowerCase());
+    });
+    console.log('[HBSN DIAG] custom elements: ' + [...new Set(customs)].join(', '));
+
+    const ifr = document.querySelectorAll('iframe');
+    console.log('[HBSN DIAG] nested iframes: ' + ifr.length);
+    console.log('[HBSN DIAG] body text (first 250): ' + ((document.body && document.body.innerText) || '').replace(/\s+/g, ' ').slice(0, 250));
+    return { groups, opts, customs };
   }
   try { window.__hbsnDiag = hbsnDiag; } catch(e){}
 
@@ -833,10 +891,6 @@
   /* ═══════════════════════════════════════
      ★ SUBMIT ENGINE
   ═══════════════════════════════════════ */
-  // Cap "click succeeded but nothing happened" retries — if we clicked submit N times
-  // and the page still didn't navigate, MTurk is rejecting because the answer isn't
-  // actually registered. Better to return the HIT cleanly than keep hammering.
-  const MAX_CLICK_STICKY_TRIES = 4;
   function submitLoop(n, clickedCount){
     clickedCount = clickedCount || 0;
 
