@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         SBI 37.3
+// @name         SBI 37.4
 // @namespace    https://worker.mturk.com/
-// @version      37.3
-// @description  v37.3 — "Submit clicked but nothing happened" fix. Answer engine now clicks crowd-radio-button by exact value=1/2 FIRST (real state update MTurk validates on submit), fireKey dispatches to document + crowd-form + crowd-form.shadowRoot + iframe contents (missed listener targets), and submitLoop bails to RETURN after 4 sticky "clicked-but-no-navigation" tries instead of hanging or garbage-submitting.
+// @version      37.4
+// @description  v37.4 — "stuck at Answer element not found — retrying" fix. Some SBI panels are keyboard-only (no clickable Yes/No exists), so the DOM answer engine loops forever. Now doAnswerEverywhere detects the SBI shortcut panel via "Select an option / Yes 1 / No 2" text and short-circuits: fire the keyboard shortcut and treat as answered. If MTurk silently rejects, submitLoop's 4-clicks-no-nav limit returns the HIT cleanly. Also: ANSWER_RETRIES 20 → 10 (fail-fast), and crowd-radio-button/group set both .checked / .value PROPERTY and attribute so all component variants pick up the state.
 // @author       Custom Script
 // @match        https://worker.mturk.com/*
 // @match        https://*.mturk.com/*
@@ -40,7 +40,7 @@
   const RETRY_MS         = 200;
   const YES_PERCENT      = 60;
   const STALE_LOCK_MS    = 25000;
-  const ANSWER_RETRIES   = 20;
+  const ANSWER_RETRIES   = 10;                    // was 20 — with the SBI-panel short-circuit in doAnswerEverywhere we should never need this many; failing faster means a truly-unanswerable HIT gets returned in ~4s instead of ~8s
 
   /* ═══════════════════════════════════════
      STRICT 26 RETURN TEXTS
@@ -627,16 +627,19 @@
       // SBI's "Yes 1 / No 2" panel is a crowd-radio-group where each button carries
       // value="1" or value="2". Clicking the button by exact value updates crowd-form's
       // internal state — which is what the Submit button validates before navigating.
-      // Text matching a wrapper <div> misses this and leads to submit-with-no-answer.
+      // Both PROPERTY and attribute paths are set so all reflected/observed variants
+      // of the component pick up the change.
       for (const cr of deepQueryAll(doc, 'crowd-radio-button')) {
           if (cr.getAttribute('value') === wantedVal) {
+              try { cr.checked = true; } catch (e) {}                      // property (component observes this)
+              try { cr.setAttribute('checked', ''); } catch (e) {}         // attribute (fallback for reflect)
               try { cr.click(); } catch (e) {}
               try { deepClick(cr); } catch (e) {}
-              try { cr.setAttribute('checked', ''); } catch (e) {}
               const grp = cr.closest && cr.closest('crowd-radio-group');
               setTimeout(() => {
                   try { cr.dispatchEvent(new Event('change', { bubbles: true, composed: true })); } catch (e) {}
                   if (grp) {
+                      try { grp.value = wantedVal; } catch (e) {}          // property
                       try { grp.setAttribute('value', wantedVal); } catch (e) {}
                       try { grp.dispatchEvent(new Event('change', { bubbles: true, composed: true })); } catch (e) {}
                   }
@@ -719,17 +722,43 @@
       return clicked;
   }
 
+  // Detect an SBI "Select an option / Yes 1 / No 2" shortcut panel. When this UI is
+  // present, MTurk's ONLY answer path is the keyboard shortcut — there is no clickable
+  // Yes/No element the user could target. So relying on doAnswerInDoc to find something
+  // clickable will loop forever.
+  function isSBIShortcutPanel() {
+    try {
+      const body = document.body ? (document.body.innerText || '') : '';
+      if (!/select\s+an\s+option/i.test(body)) return false;
+      // Look for the "Yes 1" / "No 2" shortcut labels — these are the SBI hint format.
+      return /\byes\b[\s\S]{0,4}\b1\b/i.test(body) || /\bno\b[\s\S]{0,4}\b2\b/i.test(body) ||
+             /shortcuts/i.test(body);
+    } catch (e) { return false; }
+  }
+
   function doAnswerEverywhere(choice){
-    // Try direct DOM click first (across shadow roots).
+    // 1) Direct DOM click first (crowd-radio-button by value, radios, etc.)
     if(doAnswerInDoc(document,choice)) return true;
     for(const ifr of document.querySelectorAll('iframe')){
       try{if(doAnswerInDoc(ifr.contentDocument,choice)) return true;}catch(e){}
     }
-    // SBI panels natively listen to keyboard "1" / "2" — fire the shortcut as a
-    // second try so the answer registers even if the panel is inside a shadow root
-    // we couldn't traverse (or the click target has a different structure).
+
+    // 2) SBI shortcut panel? Fire the keyboard shortcut and TREAT IT AS ANSWERED.
+    // The panel is designed for keyboard input only, so there is often no click target.
+    // If the shortcut doesn't actually register on MTurk's side, submitLoop's
+    // sticky-click limit (MAX_CLICK_STICKY_TRIES) will detect the failure and return
+    // the HIT — we won't hang forever waiting for a DOM element that will never exist.
+    if (isSBIShortcutPanel()) {
+      const k = choice === 'yes' ? '1' : '2';
+      try { fireKey(k); } catch(e) {}
+      // Fire again after brief delays — some listeners register late or debounce.
+      setTimeout(() => { try { fireKey(k); } catch(e) {} }, 120);
+      setTimeout(() => { try { fireKey(k); } catch(e) {} }, 350);
+      return true;
+    }
+
+    // 3) Non-SBI: keyboard fallback + one more DOM sweep.
     try { fireKey(choice === 'yes' ? '1' : '2'); } catch(e) {}
-    // One more DOM sweep after the shortcut — the panel may have redrawn.
     if(doAnswerInDoc(document,choice)) return true;
     for(const ifr of document.querySelectorAll('iframe')){
       try{if(doAnswerInDoc(ifr.contentDocument,choice)) return true;}catch(e){}
