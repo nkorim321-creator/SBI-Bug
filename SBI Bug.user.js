@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         SBI 38.1
+// @name         SBI 37.3
 // @namespace    https://worker.mturk.com/
-// @version      38.1
-// @description  v38.1 — fixes the crash the v38.0 diagnostic caught (MAX_CLICK_STICKY_TRIES TDZ ReferenceError that crashed every submit). Also: the live diagnostic showed SBI options are NOT crowd-radio-buttons — they're custom elements — so tier-4 now picks the shortest exact "Yes/No" cell and clicks it AND its ancestor chain (handler often on a parent row) + sets aria/data/class state. Enhanced window.__hbsnDiag() dumps option candidates + custom elements.
+// @version      37.3
+// @description  Queue processor & Task auto-answer. Default Mode V2. STRICTLY 1 Tab per HIT, Smart Close, Server Busy Redirect, Perfect Sync Answer Engine.
 // @author       Custom Script
 // @match        https://worker.mturk.com/*
 // @match        https://*.mturk.com/*
@@ -26,7 +26,7 @@
   'use strict';
 
   const TOOL_NAME = 'HasanBhaierSalamNin';
-  const VERSION   = '37.1';
+  const VERSION   = '37.3';
 
   /* ═══════════════════════════════════════
      CONFIG
@@ -40,12 +40,7 @@
   const RETRY_MS         = 200;
   const YES_PERCENT      = 60;
   const STALE_LOCK_MS    = 25000;
-  const ANSWER_RETRIES   = 10;                    // was 20 — with the SBI-panel short-circuit in doAnswerEverywhere we should never need this many; failing faster means a truly-unanswerable HIT gets returned in ~4s instead of ~8s
-  // Cap "clicked submit but page never navigated" retries. Must live in CONFIG (top of
-  // module) — declaring it next to submitLoop put it in the temporal dead zone, and
-  // submitLoop can be called during init (iframe HBSN_SUBMIT), throwing a ReferenceError
-  // that crashed every submit. This is the bug the diagnostic caught in v38.0.
-  const MAX_CLICK_STICKY_TRIES = 4;
+  const ANSWER_RETRIES   = 20;
 
   /* ═══════════════════════════════════════
      STRICT 26 RETURN TEXTS
@@ -366,7 +361,7 @@
   const inFrame = window.self !== window.top;
 
   /* ═══════════════════════════════════════
-     WRONG PAGE INSTANT REDIRECT (Amazon Home / MTurk Home)
+     WRONG PAGE INSTANT REDIRECT
   ═══════════════════════════════════════ */
   if (!inFrame) {
       const cleanUrl = window.location.href.split('?')[0].replace(/\/$/, "");
@@ -378,11 +373,11 @@
   }
 
   /* ═══════════════════════════════════════
-     SERVER BUSY / CONTINUE SHOPPING HANDLER FIX
+     SERVER BUSY / CONTINUE SHOPPING HANDLER
   ═══════════════════════════════════════ */
   let _serverBusyHandled = false;
   function handleServerBusy() {
-      if (_serverBusyHandled) return true; // Stop running anything else if already handling
+      if (_serverBusyHandled) return true; 
 
       if (!document.body) return false;
       const title = (document.title || '').toLowerCase();
@@ -390,16 +385,13 @@
       
       if (title.includes('server busy') || bodyText.includes('continue shopping')) {
           console.log('[HBSN] Server Busy detected. Clicking button to clear lock naturally...');
-          _serverBusyHandled = true; // Lock execution
+          _serverBusyHandled = true; 
 
-          // If it is a background HIT tab, close it immediately
           if (window.location.href.includes('/projects/') || sessionStorage.getItem('hbsn_is_task_tab') === 'true') {
               try { window.close(); } catch(e){}
               return true;
           }
 
-          // Main tab: Click the Continue button and wait for the natural page load. 
-          // (It will naturally redirect to MTurk home, which our WRONG PAGE logic will catch and send to /tasks).
           const els = document.querySelectorAll('a, button, input');
           let found = false;
           for (let i = 0; i < els.length; i++) {
@@ -408,23 +400,20 @@
                   try { 
                       els[i].click(); 
                       found = true;
-                      console.log('[HBSN] Clicked "Continue shopping". Waiting for natural redirect...');
                   } catch (e) {}
                   break;
               }
           }
 
-          // Fallback redirect if button was missing
           if (!found) {
               setTimeout(() => { window.location.replace('https://worker.mturk.com/tasks'); }, 2000);
           }
 
-          return true; // We handled it, do nothing else.
+          return true;
       }
       return false;
   }
 
-  // Check for Server Busy / Continue Shopping page FIRST!
   if (!inFrame && handleServerBusy()) {
       return; 
   }
@@ -499,35 +488,9 @@
     return;
   }
   
-  // ★ IFRAME: the SBI answer panel (crowd-form / "Select an option") lives in a
-  // cross-origin mturkcontent iframe. The parent can't reach it, so the iframe MUST
-  // run its own answer engine. Previous versions gated this behind hbsn_time/lock
-  // signals that the parallel rewrite stopped setting — so the iframe never ran and
-  // the HIT hung on "Answer element not found". Now the iframe SELF-DETECTS HIT
-  // content and runs on its own, no parent signal required.
-  function iframeHasHITContent(){
-    try{
-      if(!document.body) return false;
-      if(document.querySelector('crowd-form,crowd-radio-group,crowd-radio-button,crowd-checkbox,input[type="radio"]')) return true;
-      const t=(document.body.innerText||'').toLowerCase();
-      return t.includes('select an option') || t.includes('shop by interest') ||
-             t.includes('is the below item') || /\byes\b[\s\S]{0,6}\bno\b/.test(t);
-    }catch(e){ return false; }
-  }
+  // ★ IFRAME INITIALIZER
   if(inFrame){
-    let _ir=0;
-    (function pollParent(){
-      // Run if the iframe itself shows HIT content, OR the parent signalled recently,
-      // OR the lock is held. Poll for ~12s to catch late-rendering crowd-forms.
-      if(iframeHasHITContent()){ runIframe(); return; }
-      if((Date.now()-GM_getValue('hbsn_time',0))<60000){ runIframe(); return; }
-      if(isLocked()){ runIframe(); return; }
-      if(++_ir<48) setTimeout(pollParent,250);
-    })();
-    // Also run immediately if the parent explicitly tells us to.
-    window.addEventListener('message', e => {
-      if(e.data && e.data.type==='HBSN_RUN' && !window.__hbsnIframeRan){ runIframe(); }
-    });
+    runIframe();
     return;
   }
 
@@ -602,315 +565,119 @@
      ★ DEEP CLICK
   ═══════════════════════════════════════ */
   function deepClick(el){
+    if(!el) return;
     try{el.focus();}catch(e){}
-    const o={bubbles:true,cancelable:true,composed:true};
+    const o={bubbles:true,cancelable:true,composed:true,view:window};
     try{el.dispatchEvent(new PointerEvent('pointerdown',o));}catch(e){}
-    el.dispatchEvent(new MouseEvent('mousedown',o));
+    try{el.dispatchEvent(new MouseEvent('mousedown',o));}catch(e){}
     try{el.dispatchEvent(new PointerEvent('pointerup',o));}catch(e){}
-    el.dispatchEvent(new MouseEvent('mouseup',o));
-    el.dispatchEvent(new MouseEvent('click',o));
+    try{el.dispatchEvent(new MouseEvent('mouseup',o));}catch(e){}
+    try{el.dispatchEvent(new MouseEvent('click',o));}catch(e){}
     try{el.click();}catch(e){}
   }
 
   /* ═══════════════════════════════════════
-     ★ ANSWER ENGINE
+     ★ DEEP SHADOW DOM ENGINE (Finds hidden Yes 1/No 2)
   ═══════════════════════════════════════ */
   function doAnswer(choice){return doAnswerInDoc(document,choice);}
 
-  // Shadow-DOM-aware querySelectorAll — recurses into every open shadow root under `root`.
-  // SBI-style HITs render Yes/No options inside <crowd-form>'s shadow root, so a plain
-  // doc.querySelectorAll misses them entirely and the answer engine kept coming up empty.
-  function deepQueryAll(root, selector) {
-    const out = [];
-    if (!root || !root.querySelectorAll) return out;
-    try { root.querySelectorAll(selector).forEach(el => out.push(el)); } catch (e) {}
-    try {
-      root.querySelectorAll('*').forEach(el => {
-        if (el.shadowRoot) out.push(...deepQueryAll(el.shadowRoot, selector));
-      });
-    } catch (e) {}
-    return out;
-  }
-
-  function _isYesLabel(t) {
-    const s = (t || '').toLowerCase().trim();
-    return s === 'yes' || s === 'y' || s === '1' || s === 'yes 1' || s === '1 yes' ||
-           s === 'true' || s === 'relevant' || s.startsWith('yes ') || s.startsWith('yes\n');
-  }
-  function _isNoLabel(t) {
-    const s = (t || '').toLowerCase().trim();
-    return s === 'no' || s === 'n' || s === '2' || s === 'no 2' || s === '2 no' ||
-           s === '0' || s === 'false' || s === 'irrelevant' || s.startsWith('no ') || s.startsWith('no\n');
-  }
-
   function doAnswerInDoc(doc, choice) {
-      if (!doc) return false;
-      const wantYes = choice === 'yes';
-      const wantedVal = wantYes ? '1' : '2';
+      if (!doc || !doc.body) return false;
       let clicked = false;
+      const w = choice === 'yes' ? 'yes' : 'no';
+      const targets = choice === 'yes' ? ['yes', 'yes 1', '1', 'relevant', 'true'] : ['no', 'no 2', '2', 'irrelevant', 'false'];
 
-      // 0. HIGHEST-PRIORITY: crowd-radio-button with the exact value MTurk expects.
-      // SBI's "Yes 1 / No 2" panel is a crowd-radio-group where each button carries
-      // value="1" or value="2". Clicking the button by exact value updates crowd-form's
-      // internal state — which is what the Submit button validates before navigating.
-      // Both PROPERTY and attribute paths are set so all reflected/observed variants
-      // of the component pick up the change.
-      for (const cr of deepQueryAll(doc, 'crowd-radio-button')) {
-          if (cr.getAttribute('value') === wantedVal) {
-              try { cr.checked = true; } catch (e) {}                      // property (component observes this)
-              try { cr.setAttribute('checked', ''); } catch (e) {}         // attribute (fallback for reflect)
-              try { cr.click(); } catch (e) {}
-              try { deepClick(cr); } catch (e) {}
-              const grp = cr.closest && cr.closest('crowd-radio-group');
-              setTimeout(() => {
-                  try { cr.dispatchEvent(new Event('change', { bubbles: true, composed: true })); } catch (e) {}
-                  if (grp) {
-                      try { grp.value = wantedVal; } catch (e) {}          // property
-                      try { grp.setAttribute('value', wantedVal); } catch (e) {}
-                      try { grp.dispatchEvent(new Event('change', { bubbles: true, composed: true })); } catch (e) {}
-                  }
-              }, 30);
-              return true;
+      function forceCheck(node) {
+          if (!node) return;
+          deepClick(node);
+          let r = node.querySelector ? node.querySelector('input[type="radio"], input[type="checkbox"]') : null;
+          if(!r && node.parentElement) {
+              deepClick(node.parentElement);
+              r = node.parentElement.querySelector ? node.parentElement.querySelector('input[type="radio"], input[type="checkbox"]') : null;
+          }
+          if (r) {
+              r.checked = true;
+              deepClick(r);
+              r.dispatchEvent(new Event('change', { bubbles: true }));
+              r.dispatchEvent(new Event('input', { bubbles: true }));
           }
       }
 
-      // 1. Native radio / checkbox (light DOM AND shadow DOM)
-      for (const r of deepQueryAll(doc, 'input[type="radio"], input[type="checkbox"]')) {
-          const val = (r.value || '').toLowerCase();
-          let labelTxt = '';
-          if (r.id && r.getRootNode) {
-              const rootN = r.getRootNode();
-              const lbl = rootN.querySelector && rootN.querySelector(`label[for="${r.id}"]`);
-              if (lbl) labelTxt = (lbl.innerText || lbl.textContent || '').toLowerCase();
-          }
-          const parentTxt = (r.parentElement ? (r.parentElement.innerText || r.parentElement.textContent || '') : '').toLowerCase();
-          const combined = [val, labelTxt, parentTxt].join(' ').trim();
-
-          let isYes = _isYesLabel(val) || labelTxt.includes('yes') || combined.includes('relevant') && !combined.includes('irrelevant');
-          let isNo  = _isNoLabel(val)  || labelTxt.includes('no')  || combined.includes('irrelevant');
-          if (isYes && isNo) { isYes = _isYesLabel(val); isNo = _isNoLabel(val); }
-
-          if ((wantYes && isYes) || (!wantYes && isNo)) {
-              try { r.checked = true; } catch (e) {}
-              try { r.click(); } catch (e) {}
-              try { r.dispatchEvent(new Event('change', { bubbles: true })); } catch (e) {}
-              try { r.dispatchEvent(new Event('input',  { bubbles: true })); } catch (e) {}
-              clicked = true;
-          }
-      }
-      if (clicked) return true;
-
-      // 2. Amazon Crowd elements (deep — they live in shadow roots for crowd-form)
-      for (const cr of deepQueryAll(doc, 'crowd-radio-button, crowd-checkbox, crowd-tile')) {
-          const rawText = (cr.textContent || '').toLowerCase().replace(/\s+/g, ' ').trim();
-          const attrVal = (cr.getAttribute('value') || cr.getAttribute('name') || '').toLowerCase().trim();
-          const first   = rawText.split(' ')[0] || '';
-          const v = attrVal || first;
-          const isYes = _isYesLabel(v) || _isYesLabel(rawText);
-          const isNo  = _isNoLabel(v)  || _isNoLabel(rawText);
-          if ((wantYes && isYes) || (!wantYes && isNo)) {
-              try { cr.click(); } catch (e) {}
-              try { deepClick(cr); } catch (e) {}
-              setTimeout(() => {
-                  try { cr.dispatchEvent(new Event('change', { bubbles: true, composed: true })); } catch (e) {}
-                  const grp = cr.closest && cr.closest('crowd-radio-group');
-                  if (grp) { try { grp.dispatchEvent(new Event('change', { bubbles: true, composed: true })); } catch (e) {} }
-              }, 50);
-              return true;
-          }
-      }
-
-      // 3. ARIA-role radios/options — some HITs use divs with role="radio"/"option"
-      for (const el of deepQueryAll(doc, '[role="radio"], [role="option"], [role="menuitemradio"]')) {
-          const t = (el.innerText || el.textContent || '').trim().toLowerCase().replace(/\s+/g, ' ');
-          if ((wantYes && _isYesLabel(t)) || (!wantYes && _isNoLabel(t))) {
-              try { el.click(); deepClick(el); } catch (e) {}
-              clicked = true;
-              break;
-          }
-      }
-      if (clicked) return true;
-
-      // 4. Visual text match on any small clickable — SBI-style panels with "Yes 1" / "No 2".
-      // The diagnostic on the live HIT showed NO crowd-radio-button — the options are
-      // custom elements. The onclick handler often sits on a PARENT row, not the text
-      // node we match, so click the matched element AND walk up clicking each ancestor
-      // (bounded), plus set common data-* / aria state. First exact-label match wins.
-      const candidates = deepQueryAll(doc, 'tr, td, li, div, button, span, label, a, p');
-      // Prefer exact "yes"/"no"/"yes 1"/"no 2" (the option cell) over longer text.
-      let best = null, bestLen = 999;
-      for (const el of candidates) {
-          let t;
-          try { t = (el.innerText || el.textContent || '').trim().toLowerCase().replace(/\s+/g, ' '); } catch (e) { continue; }
-          if (!t || t.length > 18) continue;
-          const hit = (wantYes && _isYesLabel(t)) || (!wantYes && _isNoLabel(t));
-          if (hit && t.length < bestLen) { best = el; bestLen = t.length; }
-      }
-      if (best) {
-          const chain = [];
-          let cur = best;
-          for (let i = 0; i < 4 && cur && cur.tagName; i++) { chain.push(cur); cur = cur.parentElement; }
-          // Click the option and its ancestors (one of them carries the handler).
-          for (const el of chain) {
-              try { deepClick(el); } catch (e) {}
+      function deepQueryAll(root, sel) {
+          const res = [];
+          (function walk(n) {
+              if (!n) return;
               try {
-                  el.setAttribute && el.setAttribute('aria-checked', 'true');
-                  if (el.classList) el.classList.add('selected', 'active', 'checked');
+                  const f = n.querySelectorAll(sel);
+                  for (let i=0; i<f.length; i++) res.push(f[i]);
+                  const all = n.querySelectorAll('*');
+                  for (let i=0; i<all.length; i++) {
+                      if (all[i].shadowRoot) walk(all[i].shadowRoot);
+                  }
               } catch (e) {}
-          }
-          // Register any hidden input inside the option.
-          const r = best.querySelector && best.querySelector('input[type="radio"], input[type="checkbox"]');
-          if (r) { try { r.checked = true; r.click(); r.dispatchEvent(new Event('change', { bubbles: true })); } catch (e) {} }
-          clicked = true;
+          })(root);
+          return res;
       }
+
+      // Method 1: Inputs directly
+      const inputs = deepQueryAll(doc, 'input, button, crowd-radio-button, crowd-checkbox');
+      for (let i = 0; i < inputs.length; i++) {
+          const el = inputs[i];
+          const val = (el.value || el.getAttribute('value') || el.name || el.textContent || '').toLowerCase().trim();
+          let lblTxt = '';
+          if (el.id) {
+              const root = el.getRootNode ? el.getRootNode() : doc;
+              const lbl = root.querySelector(`label[for="${el.id}"]`);
+              if (lbl) lblTxt = (lbl.innerText || lbl.textContent || '').toLowerCase().trim();
+          }
+          const pTxt = (el.parentElement ? (el.parentElement.innerText || el.parentElement.textContent || '') : '').toLowerCase().replace(/\s+/g, ' ').trim();
+          
+          if (targets.includes(val) || targets.includes(lblTxt) || targets.some(t => pTxt === t || pTxt.startsWith(t + ' '))) {
+              forceCheck(el);
+              clicked = true;
+          }
+      }
+      if (clicked) return true;
+
+      // Method 2: Aggressive Table/Div Matching (for Yes 1 / No 2)
+      const els = deepQueryAll(doc, 'td, th, span, div, label, button, a');
+      for (let i = 0; i < els.length; i++) {
+          const el = els[i];
+          if (!el.innerText && !el.textContent) continue;
+          if (el.children.length > 5) continue; // Skip huge containers
+          
+          const txt = (el.innerText || el.textContent || el.value || '').toLowerCase().replace(/\s+/g, ' ').trim();
+          if (txt.length === 0 || txt.length > 30) continue;
+
+          if (targets.includes(txt) || txt === `${w} ${w==='yes'?'1':'2'}`) {
+              forceCheck(el);
+              clicked = true;
+              break; 
+          }
+      }
+      
       return clicked;
   }
 
-  // Detect an SBI "Select an option / Yes 1 / No 2" shortcut panel. When this UI is
-  // present, MTurk's ONLY answer path is the keyboard shortcut — there is no clickable
-  // Yes/No element the user could target. So relying on doAnswerInDoc to find something
-  // clickable will loop forever.
-  function isSBIShortcutPanel() {
-    try {
-      const body = document.body ? (document.body.innerText || '') : '';
-      if (!/select\s+an\s+option/i.test(body)) return false;
-      // Look for the "Yes 1" / "No 2" shortcut labels — these are the SBI hint format.
-      return /\byes\b[\s\S]{0,4}\b1\b/i.test(body) || /\bno\b[\s\S]{0,4}\b2\b/i.test(body) ||
-             /shortcuts/i.test(body);
-    } catch (e) { return false; }
-  }
-
-  // Describe an element compactly for the diagnostic log.
-  function _descEl(el) {
-    if (!el || !el.tagName) return '(none)';
-    const attrs = [];
-    if (el.id) attrs.push('id=' + el.id);
-    if (el.className && typeof el.className === 'string') attrs.push('cls=' + el.className.trim().slice(0, 40));
-    ['value','name','role','tabindex','data-value','data-key','data-answer','aria-checked','aria-label'].forEach(a => {
-      const v = el.getAttribute && el.getAttribute(a);
-      if (v != null) attrs.push(a + '=' + v);
-    });
-    return '<' + el.tagName.toLowerCase() + ' ' + attrs.join(' ') +
-           '> "' + ((el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 25)) + '"';
-  }
-
-  // Dump the answer-panel DOM to the console. Call window.__hbsnDiag() in any frame.
-  function hbsnDiag() {
-    const where = window.self === window.top ? 'TOP' : 'IFRAME(' + location.href.slice(0, 55) + ')';
-    console.log('%c[HBSN DIAG] ' + where, 'color:#f59e0b;font-weight:bold');
-
-    // 1) Standard selectors (deep).
-    const groups = [];
-    ['crowd-form','crowd-classifier','crowd-radio-group','crowd-radio-button','crowd-checkbox',
-     'crowd-button','input[type="radio"]','input[type="checkbox"]','[role="radio"]','[role="button"]',
-     'button','[data-value]','[data-key]','[onclick]'].forEach(sel => {
-      const els = deepQueryAll(document, sel);
-      if (els.length) {
-        groups.push(sel + ': ' + els.length);
-        els.slice(0, 4).forEach(el => groups.push('   ' + _descEl(el)));
-      }
-    });
-    console.log('[HBSN DIAG] element counts:\n' + groups.join('\n'));
-
-    // 2) Any element whose short text is exactly/starts-with yes/no/1/2 — the actual options.
-    const opts = [];
-    deepQueryAll(document, '*').forEach(el => {
-      if (opts.length >= 14) return;
-      let t;
-      try { t = (el.innerText || el.textContent || '').trim().toLowerCase().replace(/\s+/g, ' '); } catch(e){ return; }
-      if (!t || t.length > 12) return;                       // short only — option cells, not containers
-      if (/^(yes|no)\b/.test(t) || t === '1' || t === '2' || t === 'yes 1' || t === 'no 2') {
-        // Only leaf-ish nodes (few children) to avoid dumping wrappers.
-        if (el.childElementCount <= 3) opts.push(_descEl(el));
-      }
-    });
-    console.log('[HBSN DIAG] Yes/No option candidates (' + opts.length + '):\n' + opts.join('\n'));
-
-    // 3) All custom elements (tag has a dash) — SBI may use a bespoke web component.
-    const customs = [];
-    deepQueryAll(document, '*').forEach(el => {
-      if (customs.length >= 12) return;
-      if (el.tagName && el.tagName.includes('-')) customs.push(el.tagName.toLowerCase());
-    });
-    console.log('[HBSN DIAG] custom elements: ' + [...new Set(customs)].join(', '));
-
-    const ifr = document.querySelectorAll('iframe');
-    console.log('[HBSN DIAG] nested iframes: ' + ifr.length);
-    console.log('[HBSN DIAG] body text (first 250): ' + ((document.body && document.body.innerText) || '').replace(/\s+/g, ' ').slice(0, 250));
-    return { groups, opts, customs };
-  }
-  try { window.__hbsnDiag = hbsnDiag; } catch(e){}
-
   function doAnswerEverywhere(choice){
-    // 1) Direct DOM click first (crowd-radio-button by value, radios, etc.)
     if(doAnswerInDoc(document,choice)) return true;
     for(const ifr of document.querySelectorAll('iframe')){
       try{if(doAnswerInDoc(ifr.contentDocument,choice)) return true;}catch(e){}
     }
-
-    // 2) SBI shortcut panel? Fire the keyboard shortcut and TREAT IT AS ANSWERED.
-    // The panel is designed for keyboard input only, so there is often no click target.
-    // If the shortcut doesn't actually register on MTurk's side, submitLoop's
-    // sticky-click limit (MAX_CLICK_STICKY_TRIES) will detect the failure and return
-    // the HIT — we won't hang forever waiting for a DOM element that will never exist.
-    if (isSBIShortcutPanel()) {
-      const k = choice === 'yes' ? '1' : '2';
-      try { fireKey(k); } catch(e) {}
-      // Fire again after brief delays — some listeners register late or debounce.
-      setTimeout(() => { try { fireKey(k); } catch(e) {} }, 120);
-      setTimeout(() => { try { fireKey(k); } catch(e) {} }, 350);
-      return true;
-    }
-
-    // 3) Non-SBI: keyboard fallback + one more DOM sweep.
-    try { fireKey(choice === 'yes' ? '1' : '2'); } catch(e) {}
-    if(doAnswerInDoc(document,choice)) return true;
-    for(const ifr of document.querySelectorAll('iframe')){
-      try{if(doAnswerInDoc(ifr.contentDocument,choice)) return true;}catch(e){}
-    }
-    return false;
-  }
-
-  // Helper — RETURN the current HIT (used when we can't answer). Returning is
-  // MTurk-neutral: no rejection stat, no bad submission. Better than force-submit
-  // with no answer selected (which MTurk rejects).
-  function returnCurrentHIT() {
-    try {
-      const scr = document.createElement('script');
-      scr.textContent = 'window.confirm = function() { return true; };';
-      document.documentElement.appendChild(scr); scr.remove();
-    } catch (e) {}
-    GM_setValue('hbsn_returned', (GM_getValue('hbsn_returned', 0)) + 1);
-    const btn = findReturnButton();
-    if (btn) { try { btn.click(); } catch (e) {} return true; }
-    const m = url.match(/assignments\/([A-Z0-9]+)/i);
-    if (m) { try { location.href = 'https://worker.mturk.com/assignments/' + m[1] + '/return'; } catch (e) {} return true; }
     return false;
   }
 
   /* ═══════════════════════════════════════
      ★ SUBMIT ENGINE
   ═══════════════════════════════════════ */
-  function submitLoop(n, clickedCount){
-    clickedCount = clickedCount || 0;
-
+  function submitLoop(n){
     if(n > MAX_SUBMIT_TRIES){
       taskStatus('⚠️ All submit methods exhausted — trying external submit…');
       if(externalSubmit()){
         taskStatus('🚀 External submit fired! Waiting for redirect...');
       } else {
-        taskStatus('❌ Could not submit — returning HIT');
-        setTimeout(returnCurrentHIT, 300);
+        taskStatus('❌ Could not submit.');
       }
-      return;
-    }
-
-    // Submit was clicked several times AND the page hasn't navigated. Either
-    // the answer never registered (crowd-form validation blocks) or MTurk is
-    // silently rejecting. Return the HIT so we don't hang or garbage-submit.
-    if (clickedCount >= MAX_CLICK_STICKY_TRIES) {
-      taskStatus('⚠️ Submit clicks not navigating — returning HIT');
-      setTimeout(returnCurrentHIT, 300);
       return;
     }
 
@@ -926,12 +693,12 @@
     }
 
     if (clicked) {
-      console.log('[HBSN] 🚀 Submit button clicked natively. (attempt ' + (clickedCount + 1) + ')');
+      console.log('[HBSN] 🚀 Submit button clicked natively.');
       taskStatus('🚀 Submit clicked! Waiting for page to redirect...');
       showFlash('🚀','#22c55e');
-      setTimeout(() => submitLoop(n+1, clickedCount + 1), 6000);
+      setTimeout(() => submitLoop(n+1), 6000);
     } else {
-      setTimeout(()=>submitLoop(n+1, clickedCount), SUBMIT_RETRY_MS);
+      setTimeout(()=>submitLoop(n+1), SUBMIT_RETRY_MS);
     }
   }
 
@@ -1043,42 +810,10 @@
     let done=false;
     const ver=getVer();
 
-    // ★ Wake the iframe answer engine. The SBI crowd-form lives in a cross-origin
-    // iframe; it self-detects HIT content now, but we ALSO set hbsn_time (its legacy
-    // gate) and postMessage HBSN_RUN so it fires the instant it's ready — belt and
-    // suspenders. Refresh hbsn_time so the 60s freshness window never lapses.
-    GM_setValue('hbsn_time', Date.now());
-    const _timeRefresh = setInterval(() => GM_setValue('hbsn_time', Date.now()), 3000);
-    function signalIframes(){
-      document.querySelectorAll('iframe').forEach(f => {
-        try { f.contentWindow.postMessage({ type: 'HBSN_RUN' }, '*'); } catch(e){}
-      });
-    }
-    signalIframes();
-    setTimeout(signalIframes, 1500);
-    setTimeout(signalIframes, 3500);
-
-    window.addEventListener('beforeunload', () => {
+    window.addEventListener('beforeunload', () => { 
         let assignId = getAssignIdFromUrl(window.location.href) || window.location.href;
         removeActiveTask(assignId);
-        try { clearInterval(_timeRefresh); } catch(e){}
     });
-
-    // ★ HARD NO-HANG GUARANTEE. Whatever happens with answering/submitting, this HIT
-    // tab will not sit open forever. If it hasn't finished (submitted or returned)
-    // within HIT_HARD_LIMIT_MS, force-return it and close so the queue keeps flowing.
-    // Skipped while a captcha is actively being solved.
-    const HIT_HARD_LIMIT_MS = 45000;
-    const _hardLimit = setTimeout(() => {
-      if (done) return;
-      done = true;
-      try { clearInterval(_timeRefresh); } catch(e){}
-      console.warn('[HBSN] Hard 45s limit — returning stuck HIT');
-      taskStatus('⏰ Stuck 45s — returning HIT');
-      returnCurrentHIT();
-      setTimeout(() => { try { forceCloseTab(); } catch(e){} }, 2500);
-    }, HIT_HARD_LIMIT_MS);
-    window.addEventListener('beforeunload', () => { try { clearTimeout(_hardLimit); } catch(e){} });
 
     addTaskUI('…','🔍 Scanning…');
     taskStatus('⏳ Waiting for page to load…');
@@ -1209,6 +944,11 @@
       taskStatus(`${source} → ${choice.toUpperCase()} — answering…`);
       showFlash(choice==='yes'?'✅ YES':'❌ NO',choice==='yes'?'#68d391':'#fc8181');
 
+      // 🔥 Send direct pick message to iframe immediately!
+      document.querySelectorAll('iframe').forEach(f=>{
+        try{f.contentWindow.postMessage({type:'HBSN_PICK',choice:choice},'*');}catch(e){}
+      });
+
       if(doAnswerEverywhere(choice)){
         done=true;
         taskStatus('✅ Answered! Waiting '+WAIT_SUBMIT+'ms before submit…');
@@ -1222,43 +962,30 @@
         return;
       }
 
-      // Is there a cross-origin iframe we can't read? If so, the answer panel lives
-      // there and the IFRAME's own engine (runIframe) will click it and postMessage
-      // HBSN_DONE back. In that case the parent must be PATIENT — keep nudging the
-      // iframe with HBSN_PICK and wait for its reply, rather than returning the HIT
-      // out from under it. The hard 45s limit is the ultimate backstop.
-      function hasCrossOriginIframe(){
-        for (const f of document.querySelectorAll('iframe')) {
-          try { if (!f.contentDocument) return true; } catch(e) { return true; }
-        }
-        return false;
-      }
-      const waitingOnIframe = hasCrossOriginIframe();
-      if (waitingOnIframe) taskStatus('⏳ Answer is in a sub-frame — waiting for it…');
-      else                 taskStatus('⏳ Answer element not found — retrying…');
-
+      taskStatus('⏳ Answer element not found — retrying…');
       let ansRetry=0;
-      const answerCap = waitingOnIframe ? 90 : ANSWER_RETRIES;   // patient (36s) vs fail-fast (4s)
       const ansTimer = setInterval(()=>{
         if(done){clearInterval(ansTimer);return;}
         ansRetry++;
-        if(ansRetry > answerCap){
+        if(ansRetry > ANSWER_RETRIES){
           clearInterval(ansTimer);
           if(!done){
             done=true;
-            // Give up cleanly — RETURN the HIT (MTurk-neutral, no rejection stat).
-            taskStatus('⚠️ Could not answer — returning HIT');
-            showFlash('🔁','#f6ad55');
-            if (choice === 'yes') GM_setValue('hbsn_yes', Math.max(0, GM_getValue('hbsn_yes', 0) - 1));
-            else                  GM_setValue('hbsn_no',  Math.max(0, GM_getValue('hbsn_no',  0) - 1));
-            setTimeout(returnCurrentHIT, 400);
+            taskStatus('⚠️ Could not find answer — force submitting anyway…');
+            fireKey(choice==='yes'?'1':'2');
+            document.querySelectorAll('iframe').forEach(f=>{
+              try{f.contentWindow.postMessage({type:'HBSN_SUBMIT'},'*');}catch(e){}
+            });
+            setTimeout(()=>{
+               document.querySelectorAll('iframe').forEach(f=>{
+                  try{f.contentWindow.postMessage({type:'HBSN_SUBMIT'},'*');}catch(e){}
+               });
+               submitLoop(0);
+            },1500);
           }
           return;
         }
-        // Keep nudging every frame with the chosen answer (iframe listens for HBSN_PICK).
-        document.querySelectorAll('iframe').forEach(f=>{
-          try{f.contentWindow.postMessage({type:'HBSN_PICK',choice},'*');}catch(e){}
-        });
+
         if(doAnswerEverywhere(choice)){
           done=true;
           clearInterval(ansTimer);
@@ -1325,14 +1052,10 @@
   }
 
   /* ═══════════════════════════════════════
-     IFRAME HANDLER
+     IFRAME HANDLER (Perfect Sync Fix)
   ═══════════════════════════════════════ */
   function runIframe(){
-    if(window.__hbsnIframeRan) return;      // don't start the answer engine twice
-    window.__hbsnIframeRan = true;
-    const choice=GM_getValue('hbsn_choice','yes');
-    setTimeout(() => { try { hbsnDiag(); } catch(e){} }, WAIT_LOAD + 500);  // one-time structure dump for debugging
-
+    // First, check RETURN rules immediately
     const rawText = document.body.innerText || "";
     const cleanText = rawText.toLowerCase().replace(/[^a-z0-9]/g, '');
     let iframeMatched = false;
@@ -1347,24 +1070,32 @@
         try { window.top.postMessage({type:'HBSN_FORCE_RETURN'},'*'); } catch(e){}
     }
 
-    window.addEventListener('message',e=>{
-      if(e.data?.type==='HBSN_PICK'){
-        if(doAnswerInDoc(document,e.data.choice)) setTimeout(tellParent,200);
+    // Wait strictly for the parent to send the PICK command
+    window.addEventListener('message', e => {
+      if(e.data?.type === 'HBSN_PICK'){
+        let choice = e.data.choice;
+        let attempts = 0;
+        
+        function tryAnswer() {
+            attempts++;
+            // Force keyboard shortcuts as backup naturally inside iframe
+            if (attempts % 2 === 0) fireKey(choice === 'yes' ? '1' : '2');
+            
+            if (doAnswerInDoc(document, choice)) {
+                setTimeout(tellParent, 200);
+            } else if (attempts < ANSWER_RETRIES) {
+                setTimeout(tryAnswer, RETRY_MS);
+            }
+        }
+        tryAnswer();
       }
-      if(e.data?.type==='HBSN_SUBMIT'){
+      
+      if(e.data?.type === 'HBSN_SUBMIT'){
         setTimeout(()=>submitLoop(0), 200);
       }
     });
-    setTimeout(()=>answerLoop(choice,0),WAIT_LOAD);
   }
 
-  function answerLoop(c,n){
-    if(n>=ANSWER_RETRIES){fireKey(c==='yes'?'1':'2');setTimeout(tellParent,500);return;}
-    // doAnswerEverywhere (not just doAnswerInDoc) so a keyboard-only SBI panel gets its
-    // shortcut fired HERE, inside the iframe where MTurk's key listener actually lives.
-    if(doAnswerEverywhere(c)) setTimeout(tellParent,200);
-    else setTimeout(()=>answerLoop(c,n+1),RETRY_MS);
-  }
   function tellParent(){try{window.top.postMessage({type:'HBSN_DONE'},'*');}catch(e){}}
 
   /* ═══════════════════════════════════════
@@ -1373,21 +1104,7 @@
   function fireKey(key){
     const kc=key.charCodeAt(0);
     const events = ['keydown', 'keypress', 'keyup'];
-    // MTurk's SBI keyboard listener could be registered on any of these — dispatch to
-    // ALL of them so at least one hits. Missed targets in v37.2 that caused the
-    // "Submit clicked but nothing happened" bug: document itself, <crowd-form> and
-    // its shadow root, and iframe contents.
-    const targets = [document, document.activeElement, document.body, document.documentElement, window];
-    document.querySelectorAll('crowd-form').forEach(cf => {
-      targets.push(cf);
-      if (cf.shadowRoot) targets.push(cf.shadowRoot);
-    });
-    document.querySelectorAll('iframe').forEach(ifr => {
-      try {
-        if (ifr.contentDocument) { targets.push(ifr.contentDocument, ifr.contentDocument.body, ifr.contentDocument.documentElement); }
-        if (ifr.contentWindow)   { targets.push(ifr.contentWindow); }
-      } catch (e) {}
-    });
+    const targets = [document.activeElement, document.body, document.documentElement, window];
     targets.filter(Boolean).forEach(t => {
         events.forEach(ev => {
             try {
