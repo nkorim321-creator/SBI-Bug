@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         SBI 37.2
+// @name         SBI 37.3
 // @namespace    https://worker.mturk.com/
-// @version      37.2
-// @description  v37.2 — answer engine now traverses shadow DOM (fixes SBI HITs where Yes/No lives inside crowd-form's shadow root and used to be missed → force-submit-without-answer → HIT returned). Force-submit fallback replaced with an explicit RETURN of the HIT (MTurk-neutral, no rejection stat).
+// @version      37.3
+// @description  v37.3 — "Submit clicked but nothing happened" fix. Answer engine now clicks crowd-radio-button by exact value=1/2 FIRST (real state update MTurk validates on submit), fireKey dispatches to document + crowd-form + crowd-form.shadowRoot + iframe contents (missed listener targets), and submitLoop bails to RETURN after 4 sticky "clicked-but-no-navigation" tries instead of hanging or garbage-submitting.
 // @author       Custom Script
 // @match        https://worker.mturk.com/*
 // @match        https://*.mturk.com/*
@@ -620,7 +620,30 @@
   function doAnswerInDoc(doc, choice) {
       if (!doc) return false;
       const wantYes = choice === 'yes';
+      const wantedVal = wantYes ? '1' : '2';
       let clicked = false;
+
+      // 0. HIGHEST-PRIORITY: crowd-radio-button with the exact value MTurk expects.
+      // SBI's "Yes 1 / No 2" panel is a crowd-radio-group where each button carries
+      // value="1" or value="2". Clicking the button by exact value updates crowd-form's
+      // internal state — which is what the Submit button validates before navigating.
+      // Text matching a wrapper <div> misses this and leads to submit-with-no-answer.
+      for (const cr of deepQueryAll(doc, 'crowd-radio-button')) {
+          if (cr.getAttribute('value') === wantedVal) {
+              try { cr.click(); } catch (e) {}
+              try { deepClick(cr); } catch (e) {}
+              try { cr.setAttribute('checked', ''); } catch (e) {}
+              const grp = cr.closest && cr.closest('crowd-radio-group');
+              setTimeout(() => {
+                  try { cr.dispatchEvent(new Event('change', { bubbles: true, composed: true })); } catch (e) {}
+                  if (grp) {
+                      try { grp.setAttribute('value', wantedVal); } catch (e) {}
+                      try { grp.dispatchEvent(new Event('change', { bubbles: true, composed: true })); } catch (e) {}
+                  }
+              }, 30);
+              return true;
+          }
+      }
 
       // 1. Native radio / checkbox (light DOM AND shadow DOM)
       for (const r of deepQueryAll(doc, 'input[type="radio"], input[type="checkbox"]')) {
@@ -734,14 +757,30 @@
   /* ═══════════════════════════════════════
      ★ SUBMIT ENGINE
   ═══════════════════════════════════════ */
-  function submitLoop(n){
+  // Cap "click succeeded but nothing happened" retries — if we clicked submit N times
+  // and the page still didn't navigate, MTurk is rejecting because the answer isn't
+  // actually registered. Better to return the HIT cleanly than keep hammering.
+  const MAX_CLICK_STICKY_TRIES = 4;
+  function submitLoop(n, clickedCount){
+    clickedCount = clickedCount || 0;
+
     if(n > MAX_SUBMIT_TRIES){
       taskStatus('⚠️ All submit methods exhausted — trying external submit…');
       if(externalSubmit()){
         taskStatus('🚀 External submit fired! Waiting for redirect...');
       } else {
-        taskStatus('❌ Could not submit.');
+        taskStatus('❌ Could not submit — returning HIT');
+        setTimeout(returnCurrentHIT, 300);
       }
+      return;
+    }
+
+    // Submit was clicked several times AND the page hasn't navigated. Either
+    // the answer never registered (crowd-form validation blocks) or MTurk is
+    // silently rejecting. Return the HIT so we don't hang or garbage-submit.
+    if (clickedCount >= MAX_CLICK_STICKY_TRIES) {
+      taskStatus('⚠️ Submit clicks not navigating — returning HIT');
+      setTimeout(returnCurrentHIT, 300);
       return;
     }
 
@@ -757,12 +796,12 @@
     }
 
     if (clicked) {
-      console.log('[HBSN] 🚀 Submit button clicked natively.');
+      console.log('[HBSN] 🚀 Submit button clicked natively. (attempt ' + (clickedCount + 1) + ')');
       taskStatus('🚀 Submit clicked! Waiting for page to redirect...');
       showFlash('🚀','#22c55e');
-      setTimeout(() => submitLoop(n+1), 6000);
+      setTimeout(() => submitLoop(n+1, clickedCount + 1), 6000);
     } else {
-      setTimeout(()=>submitLoop(n+1), SUBMIT_RETRY_MS);
+      setTimeout(()=>submitLoop(n+1, clickedCount), SUBMIT_RETRY_MS);
     }
   }
 
@@ -1159,7 +1198,21 @@
   function fireKey(key){
     const kc=key.charCodeAt(0);
     const events = ['keydown', 'keypress', 'keyup'];
-    const targets = [document.activeElement, document.body, document.documentElement, window];
+    // MTurk's SBI keyboard listener could be registered on any of these — dispatch to
+    // ALL of them so at least one hits. Missed targets in v37.2 that caused the
+    // "Submit clicked but nothing happened" bug: document itself, <crowd-form> and
+    // its shadow root, and iframe contents.
+    const targets = [document, document.activeElement, document.body, document.documentElement, window];
+    document.querySelectorAll('crowd-form').forEach(cf => {
+      targets.push(cf);
+      if (cf.shadowRoot) targets.push(cf.shadowRoot);
+    });
+    document.querySelectorAll('iframe').forEach(ifr => {
+      try {
+        if (ifr.contentDocument) { targets.push(ifr.contentDocument, ifr.contentDocument.body, ifr.contentDocument.documentElement); }
+        if (ifr.contentWindow)   { targets.push(ifr.contentWindow); }
+      } catch (e) {}
+    });
     targets.filter(Boolean).forEach(t => {
         events.forEach(ev => {
             try {
